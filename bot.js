@@ -50,7 +50,6 @@ async function downloadMedia(message, type, jid) {
   return buffer;
 }
 
-// ⚠️ CORREÇÃO: Função opusToMp3 agora resolve a promise apenas quando o arquivo de saída está pronto
 async function opusToMp3(opusBuffer) {
   await ensureTempDir();
   const inputPath = path.join(TEMP_DIR, `audio-${Date.now()}.opus`);
@@ -184,7 +183,8 @@ async function processMessage(message, from) {
       ? `[Áudio processado] ${text}`
       : text;
     
-    await appendToContext(from, 'user', loggableText, origin);
+    // ⚠️ CORREÇÃO: Salva o texto limpo no contexto, mas loga com a tag.
+    await appendToContext(from, 'user', text, origin);
     logger.info({ event: `${origin}.processed`, text: loggableText });
   }
 
