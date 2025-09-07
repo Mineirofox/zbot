@@ -156,14 +156,17 @@ async function processMessage(message, from) {
       }
 
       const summary = await summarizeDocument(rawText.slice(0, 4000));
-      const summaryText = `[Documento resumido] ${summary}`;
+      const summaryTextForLog = `[Documento resumido] ${summary}`;
       origin = 'document';
 
-      await sendMessage(from, summaryText);
-      await appendToContext(from, "user", summaryText, "document");
+      // Salva no contexto o texto sem a tag
+      await appendToContext(from, "user", summary, "document");
       await appendToContext(from, "user", rawText.slice(0, 10000), "doc_raw");
 
-      logger.info({ event: 'document.summarized' });
+      // Envia a resposta com a tag
+      await sendMessage(from, summaryTextForLog);
+      
+      logger.info({ event: 'document.summarized', text: summaryTextForLog });
     } catch (err) {
       logger.error({ event: 'document.process.failed', error: err.message });
       await sendMessage(from, "Erro ao processar o documento.");
@@ -189,7 +192,7 @@ async function processMessage(message, from) {
 
   // === Fluxo principal ===
   
-  if (/^listar lembretes$/i.test(text)) {
+  if (/(listar|meus) lembretes/i.test(text)) {
     const reminders = await getUserReminders(from);
     if (reminders.length === 0) {
       await sendMessage(from, "Você não tem lembretes ativos.");
@@ -202,7 +205,7 @@ async function processMessage(message, from) {
     return;
   }
 
-  if (/^apagar lembretes$/i.test(text)) {
+  if (/(apagar|remover|excluir) (meus |os |todos os |)lembretes/i.test(text)) {
     await clearUserReminders(from);
     await sendMessage(from, "🗑️ Seus lembretes foram apagados.");
     return;
