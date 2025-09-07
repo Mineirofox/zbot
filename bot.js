@@ -1,28 +1,24 @@
 // bot.js
 const { DisconnectReason, makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, webSearch } = require('./openai');
+const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, webSearch, analyzeImage, summarizeDocument, extractAnyText } = require('./openai');
 const { scheduleReminder, getUserReminders, clearUserReminders } = require('./scheduler');
 const { appendToContext } = require('./contextManager');
 const logger = require('./logger');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs').promises;
+const fssync = require('fs');
 const path = require('path');
 const os = require('os');
 
-// ┌─────────────────────────────┐
-// │  CONFIGURAÇÃO DO DAYJS (TOP) │
-// └─────────────────────────────┘
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezonePlugin = require('dayjs/plugin/timezone');
 dayjs.extend(utc);
 dayjs.extend(timezonePlugin);
-// └─────────────────────────────┘
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
-// ✅ Agora usa diretório temporário do SO
 const TEMP_DIR = path.join(os.tmpdir(), 'whatsapp-bot');
 const ensureTempDir = async () => {
   try {
@@ -37,7 +33,7 @@ let sock;
 async function sendMessage(jid, text) {
   try {
     await sock.sendMessage(jid, { text });
-    await appendToContext(jid, 'assistant', text);
+    await appendToContext(jid, 'assistant', text, 'notice');
     logger.info({ event: 'whatsapp.sent', to: jid, message: text });
   } catch (error) {
     logger.error({ event: 'whatsapp.send.failed', to: jid, error: error.message });
@@ -83,11 +79,16 @@ async function processMessage(message, from) {
 
   const now = dayjs().tz('America/Sao_Paulo');
   let text = '';
+  let origin = 'text';
 
+  // Texto normal
   if (message.conversation || message.extendedTextMessage?.text) {
     text = (message.conversation || message.extendedTextMessage.text).trim();
+    origin = 'text';
     if (!text) return;
   }
+
+  // Áudio
   else if (message.audioMessage) {
     logger.info({ event: 'audio.received', from, seconds: message.audioMessage.seconds });
     try {
@@ -99,164 +100,130 @@ async function processMessage(message, from) {
         await sendMessage(from, "Não entendi seu áudio. Pode repetir?");
         return;
       }
-      text = transcription;
+      text = `[Áudio transcrito] ${transcription}`;
+      origin = 'audio';
+      await sendMessage(from, text);
       logger.info({ event: 'audio.transcribed', text });
     } catch (err) {
       logger.error({ event: 'audio.process.failed', error: err.message });
       await sendMessage(from, "Desculpe, não consegui processar seu áudio agora.");
       return;
     }
-  } else {
-    return;
   }
 
-  await appendToContext(from, 'user', text);
-
-  // Normaliza o texto (remove acentos, deixa minúsculo)
-  const cleanText = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-
-  // ✅ Comando: Pesquisa na Web
-  if (
-    cleanText.startsWith('pesquisa na internet') ||
-    cleanText.startsWith('pesquise na internet') ||
-    cleanText.startsWith('faça uma busca na internet') ||
-    cleanText.startsWith('faca uma busca na internet') ||
-    cleanText.startsWith('pesquise na web') ||
-    cleanText.startsWith('busca na web') ||
-    cleanText.startsWith('buscar na internet')
-  ) {
-    logger.info({ event: 'command.web-search', from, text });
-
-    const query = text.replace(
-      /^(pesquisa na internet|pesquise na internet|faça uma busca na internet|faca uma busca na internet|pesquise na web|busca na web|buscar na internet)\s*/i,
-      ''
-    );
-    if (!query) {
-      await sendMessage(from, "O que você deseja que eu pesquise na web? 🌐");
+  // Imagem
+  else if (message.imageMessage) {
+    logger.info({ event: 'image.received', from });
+    try {
+      const buffer = await downloadMedia(message.imageMessage, 'image', from);
+      const imagePath = path.join(TEMP_DIR, `img-${Date.now()}.jpg`);
+      await fs.writeFile(imagePath, buffer);
+      const description = await analyzeImage(imagePath);
+      await fs.unlink(imagePath);
+      text = `[Imagem analisada] ${description}`;
+      origin = 'image';
+      await sendMessage(from, text);
+      logger.info({ event: 'image.analyzed', description });
+    } catch (err) {
+      logger.error({ event: 'image.process.failed', error: err.message });
+      await sendMessage(from, "Não consegui analisar sua imagem. 😢");
       return;
     }
-
-    const result = await webSearch(query);
-    await sendMessage(from, `🔎 Resultado da pesquisa:\n\n${result}`);
-    return;
   }
 
-  // ✅ Comando: Apagar todos os lembretes
-  if (
-    cleanText.includes('apagar lembretes') ||
-    cleanText.includes('deletar lembretes') ||
-    cleanText.includes('remover lembretes') ||
-    cleanText.includes('limpar lista de lembretes') ||
-    cleanText.includes('apagar meus lembretes') ||
-    cleanText.includes('excluir todos os lembretes')
-  ) {
-    logger.info({ event: 'command.clear-reminders', from });
+  // Documento (PDF, Office, HTML, etc)
+  else if (message.documentMessage) {
+    logger.info({ event: 'document.received', from, mimetype: message.documentMessage.mimetype });
+    try {
+      const buffer = await downloadMedia(message.documentMessage, 'document', from);
+      const docPath = path.join(TEMP_DIR, `doc-${Date.now()}`);
+      await fs.writeFile(docPath, buffer);
 
-    const activeReminders = await getUserReminders(from);
+      // 🆕 extração unificada
+      const rawText = await extractAnyText(docPath, message.documentMessage.mimetype);
 
-    if (activeReminders.length === 0) {
-      await sendMessage(from, "📭 Você não tem lembretes para apagar. Tudo limpo! 🧹");
-      return;
-    }
+      await fs.unlink(docPath);
 
-    await clearUserReminders(from);
-
-    const msg = [
-      "🧹 Todos os seus lembretes foram apagados com sucesso!",
-      "Se precisar marcar outros, é só pedir. Estou por aqui! 😊"
-    ].join('\n\n');
-    await sendMessage(from, msg);
-    return;
-  }
-
-  // ✅ Comando: Listar lembretes
-  if (
-    cleanText.includes('listar lembretes') ||
-    cleanText.includes('mostrar lembretes') ||
-    cleanText.includes('mostrar agendamentos') ||
-    cleanText.includes('lembretes ativos') ||
-    cleanText.includes('quais lembretes') ||
-    cleanText.includes('meus lembretes') ||
-    cleanText.includes('ver lembretes')
-  ) {
-    logger.info({ event: 'command.list-reminders', from });
-
-    const activeReminders = await getUserReminders(from);
-
-    if (activeReminders.length === 0) {
-      await sendMessage(from, "📭 Você não tem lembretes agendados no momento. Que tal marcar um? 😊");
-      return;
-    }
-
-    let list = "📋 *Seus lembretes agendados:*\n\n";
-    activeReminders.forEach((r, i) => {
-      const scheduled = dayjs(r.scheduledAt);
-      const diff = scheduled.diff(now, 'minutes');
-      let when;
-
-      if (diff < 1) when = "em instantes";
-      else if (diff < 60) when = `em ${diff} minuto${diff > 1 ? 's' : ''}`;
-      else if (diff < 1440) when = `em ${Math.floor(diff / 60)}h`;
-      else when = `em ${Math.floor(diff / 1440)} dia${Math.floor(diff / 1440) > 1 ? 's' : ''}`;
-
-      list += `📌 *${i + 1}. ${r.content}*\n`;
-      list += `   📅 ${scheduled.format('DD/MM')} | ⏰ ${scheduled.format('HH:mm')} | ${when}\n\n`;
-    });
-
-    list += `✅ Total: ${activeReminders.length} lembrete${activeReminders.length > 1 ? 's' : ''}`;
-    await sendMessage(from, list);
-    return;
-  }
-
-  // ✅ Processa lembrete
-  const reminderData = await extractReminder(text, now);
-
-  if (reminderData.shouldRemind && reminderData.date && reminderData.time) {
-    logger.info({ event: 'intent.reminder', from, reminderData });
-
-    const timezone = reminderData.timezone || 'America/Sao_Paulo';
-    const scheduledTime = dayjs.tz(`${reminderData.date} ${reminderData.time}`, timezone);
-
-    if (scheduledTime.isBefore(now)) {
-      await sendMessage(from, `⏰ Esse horário já passou! Quer agendar para daqui a pouco?`);
-      return;
-    }
-
-    const content = reminderData.content || 'algo importante';
-
-    const confirmation = `
-✅ Beleza! Lembrete agendado!
-📅 ${scheduledTime.format('DD/MM/YYYY')}
-⏰ ${scheduledTime.format('HH:mm')} (${timezone.replace('_', ' ')})
-💬 ${content}
-Te aviso com carinho na hora! 💬`;
-    await sendMessage(from, confirmation);
-
-    await scheduleReminder(
-      {
-        from,
-        date: reminderData.date,
-        time: reminderData.time,
-        timezone,
-        content,
-        timestamp: Date.now()
-      },
-      async (to, baseContent) => {
-        const humanMsg = await generateReminderAlert(baseContent, to);
-        await sendMessage(to, humanMsg);
+      if (!rawText.trim()) {
+        await sendMessage(from, "📄 Não consegui extrair conteúdo legível desse arquivo.");
+        return;
       }
+
+      // resumo curto
+      const summary = await summarizeDocument(rawText.slice(0, 4000));
+      const summaryText = `[Documento resumido] ${summary}`;
+      origin = 'document';
+
+      // envia o resumo pro usuário
+      await sendMessage(from, summaryText);
+
+      // salva resumo visível
+      await appendToContext(from, "user", summaryText, "document");
+
+      // salva conteúdo cru limitado
+      await appendToContext(from, "user", rawText.slice(0, 10000), "doc_raw");
+
+      logger.info({ event: 'document.summarized' });
+    } catch (err) {
+      logger.error({ event: 'document.process.failed', error: err.message });
+      await sendMessage(from, "Erro ao processar o documento.");
+      return;
+    }
+  }
+
+  else {
+    return;
+  }
+
+  // → Salva no contexto (para textos/áudios/imagens normais)
+  if (origin === 'text' || origin === 'audio' || origin === 'image') {
+    await appendToContext(from, 'user', text, origin);
+  }
+
+  // === Fluxo principal ===
+
+  if (/^listar lembretes$/i.test(text)) {
+    const reminders = getUserReminders(from);
+    if (reminders.length === 0) {
+      await sendMessage(from, "Você não tem lembretes ativos.");
+    } else {
+      const list = reminders.map((r, i) =>
+        `📌 ${i + 1}. ${r.content} - ${r.time.format("DD/MM HH:mm")}`
+      ).join("\n");
+      await sendMessage(from, `📋 Seus lembretes:\n${list}`);
+    }
+    return;
+  }
+
+  if (/^apagar lembretes$/i.test(text)) {
+    clearUserReminders(from);
+    await sendMessage(from, "🗑️ Seus lembretes foram apagados.");
+    return;
+  }
+
+  if (/^pesquisar (.+)$/i.test(text)) {
+    const query = text.match(/^pesquisar (.+)$/i)[1];
+    const result = await webSearch(query);
+    await sendMessage(from, `🔎 Resultado da pesquisa:\n${result}`);
+    return;
+  }
+
+  const parsed = await extractReminder(text, now);
+  if (parsed.shouldRemind) {
+    const when = dayjs.tz(
+      `${parsed.date} ${parsed.time}`,
+      "YYYY-MM-DD HH:mm",
+      parsed.timezone || "America/Sao_Paulo"
     );
-
-    return;
+    if (when.isValid()) {
+      const alert = await generateReminderAlert(parsed.content);
+      scheduleReminder(from, parsed.content, when, () => sendMessage(from, alert));
+      await sendMessage(from, `✅ Agendei seu lembrete: *${parsed.content}* em ${when.format("DD/MM [às] HH:mm")}`);
+      return;
+    }
   }
 
-  if (reminderData.shouldRemind) {
-    logger.warn({ event: 'reminder.incomplete', from, reminderData });
-    await sendMessage(from, "Desculpe, não entendi bem quando você quer ser lembrado. Pode ser mais específico?");
-    return;
-  }
-
-  logger.info({ event: 'intent.chat', from, message: text });
+  // Chat normal
   const reply = await chatResponse(text, from);
   await sendMessage(from, reply);
 }
@@ -265,22 +232,16 @@ async function startBot() {
   logger.info('🚀 Inicializando bot de lembretes no WhatsApp...');
   await ensureTempDir();
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  sock = makeWASocket({
-    auth: state
-  });
+  sock = makeWASocket({ auth: state });
 
   sock.ev.process(async (events) => {
     if (events['connection.update']) {
       const { connection, lastDisconnect, qr } = events['connection.update'];
-
       if (qr) {
         const qrcode = require('qrcode-terminal');
-        console.log('┌─────────────────────────────┐');
-        console.log('│      ESCANEIE O QR CODE     │');
-        console.log('└─────────────────────────────┘');
+        console.log("📲 Escaneie o QR abaixo para conectar:");
         qrcode.generate(qr, { small: true });
       }
-
       if (connection === 'close') {
         const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
         logger.warn({ event: 'connection.closed', reconnect: shouldReconnect });

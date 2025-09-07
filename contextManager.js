@@ -1,72 +1,79 @@
-const fs = require('fs').promises;
-const path = require('path');
-const config = require('./config');
-const { OpenAI } = require('openai');
+// contextManager.js
+/**
+ * Gerencia o histórico de contexto por usuário
+ * Armazena mensagens multimodais (texto, áudio, imagem, documento, avisos)
+ */
 
-const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
+const fs = require("fs").promises;
+const path = require("path");
+const logger = require("./logger");
 
-async function ensureContextDir() {
+const CONTEXTS_FILE = path.join(__dirname, "contexts.json");
+
+// Carregar contextos do disco
+async function loadContexts() {
   try {
-    await fs.access(config.CONTEXT_DIR);
+    const data = await fs.readFile(CONTEXTS_FILE, "utf-8");
+    return JSON.parse(data);
   } catch {
-    await fs.mkdir(config.CONTEXT_DIR, { recursive: true });
+    return {};
   }
 }
 
-function getContextFilePath(jid) {
-  const safeJid = jid.replace(/[^\w]/g, '_');
-  return path.join(config.CONTEXT_DIR, `contexto-${safeJid}.json`);
-}
-
-async function loadContext(jid) {
-  await ensureContextDir();
-  const filePath = getContextFilePath(jid);
+// Salvar contextos no disco
+async function saveContexts(contexts) {
   try {
-    const data = await fs.readFile(filePath, 'utf-8');
-    const context = JSON.parse(data);
-    return Array.isArray(context) ? context : [];
+    await fs.writeFile(CONTEXTS_FILE, JSON.stringify(contexts, null, 2));
   } catch (err) {
-    return [];
+    logger.error({ event: "context.save.error", error: err.message });
   }
 }
 
-async function summarizeContext(messages) {
-  try {
-    const prompt = `
-Resuma em português o seguinte histórico de conversa de forma bem curta, só os pontos principais:
-${messages.map(m => `[${m.role}] ${m.content}`).join('\n')}
-    `;
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 120
-    });
-    return completion.choices[0].message.content.trim();
-  } catch (err) {
-    return "Resumo automático indisponível.";
-  }
-}
-
-async function saveContext(jid, messages) {
-  await ensureContextDir();
-  const filePath = getContextFilePath(jid);
-  const maxSize = config.CONTEXT_WINDOW_SIZE;
-
-  let truncated = messages.slice(-maxSize);
-  if (messages.length > maxSize) {
-    const oldMessages = messages.slice(0, messages.length - maxSize);
-    const summary = await summarizeContext(oldMessages);
-    truncated.unshift({ role: "system", content: `Resumo de conversas anteriores: ${summary}` });
+/**
+ * Adiciona algo ao contexto
+ * @param {string} userId - JID do usuário
+ * @param {string} role - Quem falou (user | assistant | system)
+ * @param {string} content - O texto associado
+ * @param {string} [origin="text"] - Origem da mensagem (text | audio | image | document | notice)
+ */
+async function appendToContext(userId, role, content, origin = "text") {
+  const contexts = await loadContexts();
+  if (!contexts[userId]) {
+    contexts[userId] = [];
   }
 
-  await fs.writeFile(filePath, JSON.stringify(truncated, null, 2), 'utf-8');
+  contexts[userId].push({
+    timestamp: new Date().toISOString(),
+    role,
+    origin,
+    content,
+  });
+
+  // Mantém o histórico enxuto (últimas 30 entradas)
+  if (contexts[userId].length > 30) {
+    contexts[userId] = contexts[userId].slice(-30);
+  }
+
+  await saveContexts(contexts);
+  logger.info({ event: "context.appended", userId, role, origin, preview: content.slice(0, 50) });
 }
 
-async function appendToContext(jid, role, content) {
-  const context = await loadContext(jid);
-  const newEntry = { role, content, timestamp: new Date().toISOString() };
-  context.push(newEntry);
-  await saveContext(jid, context);
+// Recuperar contexto de um usuário
+async function getContext(userId) {
+  const contexts = await loadContexts();
+  return contexts[userId] || [];
 }
 
-module.exports = { loadContext, saveContext, appendToContext };
+// Resetar contexto de um usuário
+async function resetContext(userId) {
+  const contexts = await loadContexts();
+  contexts[userId] = [];
+  await saveContexts(contexts);
+  logger.info({ event: "context.reset", userId });
+}
+
+module.exports = {
+  appendToContext,
+  getContext,
+  resetContext,
+};
