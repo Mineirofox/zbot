@@ -183,7 +183,6 @@ async function processMessage(message, from) {
       ? `[Áudio processado] ${text}`
       : text;
     
-    // ⚠️ CORREÇÃO: Salva o texto limpo no contexto, mas loga com a tag.
     await appendToContext(from, 'user', text, origin);
     logger.info({ event: `${origin}.processed`, text: loggableText });
   }
