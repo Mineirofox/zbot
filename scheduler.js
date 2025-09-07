@@ -18,7 +18,10 @@ async function loadReminders() {
 }
 
 async function saveReminders(reminders) {
-  await fs.writeFile(REMINDERS_FILE, JSON.stringify(reminders, null, 2), 'utf-8');
+  // proteção contra corrupção do arquivo
+  const tmpPath = REMINDERS_FILE + '.tmp';
+  await fs.writeFile(tmpPath, JSON.stringify(reminders, null, 2), 'utf-8');
+  await fs.rename(tmpPath, REMINDERS_FILE);
 }
 
 async function scheduleReminder(reminder, sendFn) {
@@ -27,18 +30,36 @@ async function scheduleReminder(reminder, sendFn) {
   reminder.scheduledAt = dayjs.tz(`${reminder.date} ${reminder.time}`, reminder.timezone).toISOString();
   reminders.push(reminder);
   await saveReminders(reminders);
+  _armReminder(reminder, sendFn);
+}
 
+function _armReminder(reminder, sendFn) {
   const alarmTime = new Date(reminder.scheduledAt).getTime();
   const now = Date.now();
   const delay = alarmTime - now;
 
   if (delay > 0) {
     setTimeout(async () => {
-      await sendFn(reminder.from, reminder.content);
+      try {
+        await sendFn(reminder.from, reminder.content);
+      } catch (err) {
+        console.error("❌ Falha ao enviar lembrete:", err.message);
+      }
       const updated = (await loadReminders()).filter(r => r.id !== reminder.id);
       await saveReminders(updated);
     }, delay);
   }
+}
+
+async function reloadAllReminders(sendFn) {
+  const reminders = await loadReminders();
+  const now = Date.now();
+  reminders.forEach(rem => {
+    const alarmTime = new Date(rem.scheduledAt).getTime();
+    if (alarmTime > now) {
+      _armReminder(rem, sendFn);
+    }
+  });
 }
 
 async function getUserReminders(jid) {
@@ -58,11 +79,17 @@ async function getUserReminders(jid) {
     .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
 }
 
-// ✅ Nova função: apagar todos os lembretes do usuário
 async function clearUserReminders(jid) {
   const reminders = await loadReminders();
   const remaining = reminders.filter(r => r.from !== jid || new Date(r.scheduledAt).getTime() <= Date.now());
   await saveReminders(remaining);
 }
 
-module.exports = { scheduleReminder, loadReminders, saveReminders, getUserReminders, clearUserReminders };
+module.exports = { 
+  scheduleReminder, 
+  loadReminders, 
+  saveReminders, 
+  getUserReminders, 
+  clearUserReminders, 
+  reloadAllReminders 
+};

@@ -1,6 +1,6 @@
 // bot.js
 const { DisconnectReason, makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert } = require('./openai');
+const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, webSearch } = require('./openai');
 const { scheduleReminder, getUserReminders, clearUserReminders } = require('./scheduler');
 const { appendToContext } = require('./contextManager');
 const logger = require('./logger');
@@ -8,6 +8,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs').promises;
 const path = require('path');
+const os = require('os');
 
 // ┌─────────────────────────────┐
 // │  CONFIGURAÇÃO DO DAYJS (TOP) │
@@ -21,12 +22,13 @@ dayjs.extend(timezonePlugin);
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
-const TEMP_DIR = './temp';
+// ✅ Agora usa diretório temporário do SO
+const TEMP_DIR = path.join(os.tmpdir(), 'whatsapp-bot');
 const ensureTempDir = async () => {
   try {
     await fs.access(TEMP_DIR);
   } catch {
-    await fs.mkdir(TEMP_DIR);
+    await fs.mkdir(TEMP_DIR, { recursive: true });
   }
 };
 
@@ -80,7 +82,6 @@ async function processMessage(message, from) {
   logger.info({ event: 'message.received', from });
 
   const now = dayjs().tz('America/Sao_Paulo');
-
   let text = '';
 
   if (message.conversation || message.extendedTextMessage?.text) {
@@ -111,8 +112,34 @@ async function processMessage(message, from) {
 
   await appendToContext(from, 'user', text);
 
-  // Normaliza o texto
+  // Normaliza o texto (remove acentos, deixa minúsculo)
   const cleanText = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+  // ✅ Comando: Pesquisa na Web
+  if (
+    cleanText.startsWith('pesquisa na internet') ||
+    cleanText.startsWith('pesquise na internet') ||
+    cleanText.startsWith('faça uma busca na internet') ||
+    cleanText.startsWith('faca uma busca na internet') ||
+    cleanText.startsWith('pesquise na web') ||
+    cleanText.startsWith('busca na web') ||
+    cleanText.startsWith('buscar na internet')
+  ) {
+    logger.info({ event: 'command.web-search', from, text });
+
+    const query = text.replace(
+      /^(pesquisa na internet|pesquise na internet|faça uma busca na internet|faca uma busca na internet|pesquise na web|busca na web|buscar na internet)\s*/i,
+      ''
+    );
+    if (!query) {
+      await sendMessage(from, "O que você deseja que eu pesquise na web? 🌐");
+      return;
+    }
+
+    const result = await webSearch(query);
+    await sendMessage(from, `🔎 Resultado da pesquisa:\n\n${result}`);
+    return;
+  }
 
   // ✅ Comando: Apagar todos os lembretes
   if (
@@ -132,10 +159,8 @@ async function processMessage(message, from) {
       return;
     }
 
-    // Apaga
     await clearUserReminders(from);
 
-    // Confirmação humanizada
     const msg = [
       "🧹 Todos os seus lembretes foram apagados com sucesso!",
       "Se precisar marcar outros, é só pedir. Estou por aqui! 😊"

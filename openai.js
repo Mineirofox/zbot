@@ -1,19 +1,27 @@
 // openai.js
-const { OpenAI } = require('openai');
-const config = require('./config');
-const logger = require('./logger');
-const fs = require('fs');
+const { OpenAI } = require("openai");
+const config = require("./config");
+const logger = require("./logger");
+const fs = require("fs");
 
+// --- Cliente oficial OpenAI (para GPT e Whisper) ---
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
-// --- Prompt com data/hora atual fornecida ---
+// --- Cliente Poe (para Web Search) ---
+const poe = new OpenAI({
+  apiKey: config.POE_API_KEY,
+  baseURL: "https://api.poe.com/v1",
+});
+
+// --- Prompt de lembrete ---
 function getReminderPrompt(currentDateTime) {
   return `
 Você é um especialista em extrair lembretes de mensagens informais em português do Brasil.
+Data e hora atuais: ${currentDateTime.format(
+    "dddd, DD [de] MMMM [de] YYYY [às] HH:mm:ss"
+  )} (fuso: America/Sao_Paulo)
 
-Data e hora atuais do sistema: ${currentDateTime.format('dddd, DD [de] MMMM [de] YYYY [às] HH:mm:ss')} (fuso: America/Sao_Paulo)
-
-Analise a mensagem e responda APENAS em JSON:
+Responda apenas em JSON:
 {
   "shouldRemind": boolean,
   "date": "YYYY-MM-DD" | null,
@@ -21,92 +29,66 @@ Analise a mensagem e responda APENAS em JSON:
   "timezone": "string" | null,
   "content": "string" | null
 }
-
-Regras:
-- shouldRemind = true apenas se houver intenção clara: "me lembre", "não esqueça", "avise", etc.
-- Use a data/hora atual acima para calcular relativas: "em 1 minuto", "daqui a 3 horas", "amanhã"
-- Converta tudo para valores absolutos (ex: se agora é 23:45, "em 1 minuto" → 23:46 do mesmo dia)
-- "meio dia" = "12:00", "meia-noite" = "00:00"
-- Fuso padrão: America/Sao_Paulo
-- content = ação: "comer pizza", "ligar pro médico"
-- Nunca invente. Se não souber, deixe null.
 `;
 }
 
+// --- Extrair lembrete ---
 async function extractReminder(text, currentDateTime) {
-  logger.debug({ event: 'openai.extractReminder.start', message: text, currentDateTime: currentDateTime.format() });
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: "gpt-4o",
       messages: [
-        { role: 'system', content: getReminderPrompt(currentDateTime) },
-        { role: 'user', content: text }
+        { role: "system", content: getReminderPrompt(currentDateTime) },
+        { role: "user", content: text },
       ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2
+      response_format: { type: "json_object" },
+      temperature: 0.2,
     });
-    const result = JSON.parse(completion.choices[0].message.content);
-    logger.info({ event: 'openai.extractReminder.success', message: text, result });
-    return result;
+    return JSON.parse(completion.choices[0].message.content);
   } catch (error) {
-    logger.error({ event: 'openai.extractReminder.error', message: text, error: error.message });
+    logger.error({ event: "openai.extractReminder.error", error: error.message });
     return { shouldRemind: false };
   }
 }
 
-// --- Resposta natural no chat ---
+// --- Chat normal ---
 const chatPrompt = `
 Você é um assistente pessoal brasileiro, empático e natural.
 - Nunca diga que é IA.
-- Responda com empatia, como um amigo.
-- Use no máximo 2 frases.
-- Pode usar emojis com moderação.
-- Se disser "oi", responda com "Ei! Tudo bem? Como posso te ajudar? 😊"
+- Responda como um amigo próximo.
+- Máx 2 frases.
+- Emojis moderados.
 `;
 
 async function chatResponse(text, jid) {
-  logger.debug({ event: 'openai.chatResponse.start', jid, message: text });
   try {
-    const context = await require('./contextManager').loadContext(jid);
-    const messages = [
-      { role: 'system', content: chatPrompt },
-      ...context,
-      { role: 'user', content: text }
-    ];
-
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages,
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: chatPrompt },
+        { role: "user", content: text },
+      ],
       max_tokens: 150,
-      temperature: 0.8
+      temperature: 0.8,
     });
-
-    const reply = completion.choices[0].message.content.trim();
-    logger.info({ event: 'openai.chatResponse.success', jid, reply });
-    return reply;
+    return completion.choices[0].message.content.trim();
   } catch (error) {
-    logger.error({ event: 'openai.chatResponse.error', jid, error: error.message });
-    return "Deu um probleminha... Mas tô aqui, pode repetir?";
+    return "Deu um probleminha... pode repetir?";
   }
 }
 
-// --- Gera aviso humanizado no horário do lembrete ---
-async function generateReminderAlert(content, jid) {
-  const prompt = `
-Gere um aviso natural e empático para lembrar alguém de: "${content}"
-- Seja gentil, como um amigo lembrando com carinho
-- Use no máximo 1 frase
-- Pode usar emojis
-- Nunca diga "Lembrete:"
-- Ex: "Ei, amor, não esquece de tomar água! 💧"
-  `;
-
+// --- Aviso humanizado de lembrete ---
+async function generateReminderAlert(content) {
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 256,
-      temperature: 0.9
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: `Gere um aviso natural para lembrar: "${content}" em 1 frase curta e amigável.`,
+        },
+      ],
+      temperature: 0.9,
     });
     return completion.choices[0].message.content.trim();
   } catch (err) {
@@ -116,20 +98,40 @@ Gere um aviso natural e empático para lembrar alguém de: "${content}"
 
 // --- Transcrição de áudio ---
 async function transcribeAudio(filePath) {
-  logger.info({ event: 'audio.transcribe.start', file: filePath });
   try {
     const fileStream = fs.createReadStream(filePath);
     const transcription = await openai.audio.transcriptions.create({
       file: fileStream,
-      model: 'whisper-1',
-      language: 'pt'
+      model: "whisper-1",
+      language: "pt",
     });
-    logger.info({ event: 'audio.transcribe.success', text: transcription.text });
     return transcription.text.trim();
   } catch (error) {
-    logger.error({ event: 'audio.transcribe.error', error: error.message });
-    throw new Error('Falha na transcrição: ' + error.message);
+    throw new Error("Falha na transcrição: " + error.message);
   }
 }
 
-module.exports = { extractReminder, chatResponse, transcribeAudio, generateReminderAlert };
+// --- Busca na web (via Poe Web-Search) ---
+async function webSearch(query) {
+  logger.info({ event: "poe.webSearch.start", query });
+
+  try {
+    const chat = await poe.chat.completions.create({
+      model: "Web-Search",
+      messages: [{ role: "user", content: query }],
+    });
+
+    return chat.choices[0].message.content.trim();
+  } catch (error) {
+    logger.error({ event: "poe.webSearch.error", error: error.message });
+    return `⚠️ Erro na busca via Poe: ${error.message}`;
+  }
+}
+
+module.exports = {
+  extractReminder,
+  chatResponse,
+  transcribeAudio,
+  generateReminderAlert,
+  webSearch,
+};

@@ -7,3 +7,7 @@ temp/
 .env.local
 .DS_Store
 Thumbs.db
+# 🔐 Novos ignores
+reminders.json
+*.mp3
+*.opus
