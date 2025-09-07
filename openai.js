@@ -1,4 +1,3 @@
-// openai.js
 const { OpenAI } = require("openai");
 const config = require("./config");
 const logger = require("./logger");

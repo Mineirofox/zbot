@@ -1,4 +1,3 @@
-// bot.js
 const { DisconnectReason, makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require('@whiskeysockets/baileys');
 const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, webSearch, analyzeImage, summarizeDocument, extractAnyText } = require('./openai');
 const { scheduleReminder, getUserReminders, clearUserReminders } = require('./scheduler');
@@ -51,26 +50,32 @@ async function downloadMedia(message, type, jid) {
   return buffer;
 }
 
+// ⚠️ CORREÇÃO: Função opusToMp3 agora resolve a promise apenas quando o arquivo de saída está pronto
 async function opusToMp3(opusBuffer) {
   await ensureTempDir();
   const inputPath = path.join(TEMP_DIR, `audio-${Date.now()}.opus`);
   const outputPath = path.join(TEMP_DIR, `audio-${Date.now()}.mp3`);
-  await fs.writeFile(inputPath, opusBuffer);
 
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .output(outputPath)
-      .audioCodec('libmp3lame')
-      .on('end', async () => {
-        await fs.unlink(inputPath).catch(console.warn);
-        resolve(outputPath);
-      })
-      .on('error', async (err) => {
-        await fs.unlink(inputPath).catch(console.warn);
-        await fs.unlink(outputPath).catch(console.warn);
-        reject(err);
-      })
-      .run();
+    fssync.writeFile(inputPath, opusBuffer, (err) => {
+      if (err) {
+        return reject(new Error(`Failed to write opus file: ${err.message}`));
+      }
+      
+      ffmpeg(inputPath)
+        .output(outputPath)
+        .audioCodec('libmp3lame')
+        .on('end', async () => {
+          await fs.unlink(inputPath).catch(() => {});
+          resolve(outputPath);
+        })
+        .on('error', async (err) => {
+          await fs.unlink(inputPath).catch(() => {});
+          await fs.unlink(outputPath).catch(() => {});
+          reject(new Error(`FFmpeg failed: ${err.message}`));
+        })
+        .run();
+    });
   });
 }
 
@@ -91,76 +96,72 @@ async function processMessage(message, from) {
   // Áudio
   else if (message.audioMessage) {
     logger.info({ event: 'audio.received', from, seconds: message.audioMessage.seconds });
+    await sock.sendPresenceUpdate('composing', from);
+    let mp3Path = null;
     try {
       const buffer = await downloadMedia(message.audioMessage, 'audio', from);
-      const mp3Path = await opusToMp3(buffer);
+      mp3Path = await opusToMp3(buffer);
       const transcription = await transcribeAudio(mp3Path);
-      await fs.unlink(mp3Path);
       if (!transcription) {
         await sendMessage(from, "Não entendi seu áudio. Pode repetir?");
         return;
       }
-      text = `[Áudio transcrito] ${transcription}`;
+      text = transcription;
       origin = 'audio';
-      await sendMessage(from, text);
-      logger.info({ event: 'audio.transcribed', text });
     } catch (err) {
       logger.error({ event: 'audio.process.failed', error: err.message });
-      await sendMessage(from, "Desculpe, não consegui processar seu áudio agora.");
+      await sendMessage(from, "Desculpe, não consegui transcrever seu áudio.");
       return;
+    } finally {
+      if (mp3Path) {
+        await fs.unlink(mp3Path).catch(() => {});
+      }
     }
   }
 
   // Imagem
   else if (message.imageMessage) {
     logger.info({ event: 'image.received', from });
+    await sock.sendPresenceUpdate('composing', from);
+    const imagePath = path.join(TEMP_DIR, `img-${Date.now()}.jpg`);
     try {
       const buffer = await downloadMedia(message.imageMessage, 'image', from);
-      const imagePath = path.join(TEMP_DIR, `img-${Date.now()}.jpg`);
       await fs.writeFile(imagePath, buffer);
       const description = await analyzeImage(imagePath);
-      await fs.unlink(imagePath);
-      text = `[Imagem analisada] ${description}`;
+      text = description;
       origin = 'image';
       await sendMessage(from, text);
-      logger.info({ event: 'image.analyzed', description });
     } catch (err) {
       logger.error({ event: 'image.process.failed', error: err.message });
-      await sendMessage(from, "Não consegui analisar sua imagem. 😢");
+      await sendMessage(from, "Não consegui analisar sua imagem. 😥");
       return;
+    } finally {
+      await fs.unlink(imagePath).catch(() => {});
     }
   }
 
   // Documento (PDF, Office, HTML, etc)
   else if (message.documentMessage) {
     logger.info({ event: 'document.received', from, mimetype: message.documentMessage.mimetype });
+    await sock.sendPresenceUpdate('composing', from);
+    const docPath = path.join(TEMP_DIR, `doc-${Date.now()}`);
     try {
       const buffer = await downloadMedia(message.documentMessage, 'document', from);
-      const docPath = path.join(TEMP_DIR, `doc-${Date.now()}`);
       await fs.writeFile(docPath, buffer);
 
-      // 🆕 extração unificada
       const rawText = await extractAnyText(docPath, message.documentMessage.mimetype);
-
-      await fs.unlink(docPath);
 
       if (!rawText.trim()) {
         await sendMessage(from, "📄 Não consegui extrair conteúdo legível desse arquivo.");
         return;
       }
 
-      // resumo curto
       const summary = await summarizeDocument(rawText.slice(0, 4000));
       const summaryText = `[Documento resumido] ${summary}`;
       origin = 'document';
 
-      // envia o resumo pro usuário
       await sendMessage(from, summaryText);
-
-      // salva resumo visível
       await appendToContext(from, "user", summaryText, "document");
-
-      // salva conteúdo cru limitado
       await appendToContext(from, "user", rawText.slice(0, 10000), "doc_raw");
 
       logger.info({ event: 'document.summarized' });
@@ -168,6 +169,8 @@ async function processMessage(message, from) {
       logger.error({ event: 'document.process.failed', error: err.message });
       await sendMessage(from, "Erro ao processar o documento.");
       return;
+    } finally {
+      await fs.unlink(docPath).catch(() => {});
     }
   }
 
@@ -175,20 +178,25 @@ async function processMessage(message, from) {
     return;
   }
 
-  // → Salva no contexto (para textos/áudios/imagens normais)
-  if (origin === 'text' || origin === 'audio' || origin === 'image') {
-    await appendToContext(from, 'user', text, origin);
+  // === Salvar no contexto e Logar ===
+  if (origin !== 'document' && origin !== 'image') { // Documento e imagem já lidam com isso
+    const loggableText = (origin === 'audio')
+      ? `[Áudio processado] ${text}`
+      : text;
+    
+    await appendToContext(from, 'user', loggableText, origin);
+    logger.info({ event: `${origin}.processed`, text: loggableText });
   }
 
   // === Fluxo principal ===
-
+  
   if (/^listar lembretes$/i.test(text)) {
-    const reminders = getUserReminders(from);
+    const reminders = await getUserReminders(from);
     if (reminders.length === 0) {
       await sendMessage(from, "Você não tem lembretes ativos.");
     } else {
       const list = reminders.map((r, i) =>
-        `📌 ${i + 1}. ${r.content} - ${r.time.format("DD/MM HH:mm")}`
+        `📌 ${i + 1}. ${r.content} - ${dayjs(r.scheduledAt).tz('America/Sao_Paulo').format("DD/MM [às] HH:mm")}`
       ).join("\n");
       await sendMessage(from, `📋 Seus lembretes:\n${list}`);
     }
@@ -196,7 +204,7 @@ async function processMessage(message, from) {
   }
 
   if (/^apagar lembretes$/i.test(text)) {
-    clearUserReminders(from);
+    await clearUserReminders(from);
     await sendMessage(from, "🗑️ Seus lembretes foram apagados.");
     return;
   }
@@ -210,15 +218,18 @@ async function processMessage(message, from) {
 
   const parsed = await extractReminder(text, now);
   if (parsed.shouldRemind) {
-    const when = dayjs.tz(
-      `${parsed.date} ${parsed.time}`,
-      "YYYY-MM-DD HH:mm",
-      parsed.timezone || "America/Sao_Paulo"
-    );
-    if (when.isValid()) {
+    if (parsed.date && parsed.time) {
       const alert = await generateReminderAlert(parsed.content);
-      scheduleReminder(from, parsed.content, when, () => sendMessage(from, alert));
-      await sendMessage(from, `✅ Agendei seu lembrete: *${parsed.content}* em ${when.format("DD/MM [às] HH:mm")}`);
+      const reminder = {
+        from: from,
+        content: parsed.content,
+        date: parsed.date,
+        time: parsed.time,
+        timezone: parsed.timezone || 'America/Sao_Paulo',
+      };
+      await scheduleReminder(reminder, () => sendMessage(from, alert));
+      const scheduledTime = dayjs.tz(`${parsed.date} ${parsed.time}`, 'YYYY-MM-DD HH:mm', parsed.timezone || 'America/Sao_Paulo');
+      await sendMessage(from, `✅ Agendei seu lembrete: *${parsed.content}* em ${scheduledTime.format("DD/MM [às] HH:mm")}`);
       return;
     }
   }

@@ -1,4 +1,3 @@
-// contextManager.js
 /**
  * Gerencia o histórico de contexto por usuário
  * Armazena mensagens multimodais (texto, áudio, imagem, documento, avisos)
@@ -7,8 +6,9 @@
 const fs = require("fs").promises;
 const path = require("path");
 const logger = require("./logger");
+const config = require("./config");
 
-const CONTEXTS_FILE = path.join(__dirname, "contexts.json");
+const CONTEXTS_FILE = path.join(__dirname, config.CONTEXTS_FILE);
 
 // Carregar contextos do disco
 async function loadContexts() {
@@ -64,16 +64,7 @@ async function getContext(userId) {
   return contexts[userId] || [];
 }
 
-// Resetar contexto de um usuário
-async function resetContext(userId) {
-  const contexts = await loadContexts();
-  contexts[userId] = [];
-  await saveContexts(contexts);
-  logger.info({ event: "context.reset", userId });
-}
-
 module.exports = {
   appendToContext,
-  getContext,
-  resetContext,
+  getContext
 };
