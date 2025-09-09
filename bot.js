@@ -1,15 +1,14 @@
 const { DisconnectReason, makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, webSearch, analyzeImage, summarizeDocument, extractAnyText } = require('./openai');
+const { extractReminder, chatResponse, transcribeAudio, generateReminderAlert, summarizeDocument, extractAnyText } = require('./openai');
 const { scheduleReminder, getUserReminders, clearUserReminders } = require('./scheduler');
 const { appendToContext } = require('./contextManager');
 const logger = require('./logger');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs').promises;
-const fssync = require('fs');
 const path = require('path');
 const os = require('os');
-
+const mime = require('mime-types');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezonePlugin = require('dayjs/plugin/timezone');
@@ -29,222 +28,150 @@ const ensureTempDir = async () => {
 
 let sock;
 
-async function sendMessage(jid, text) {
+async function sendMessage(jid, text, options = {}) {
   try {
-    await sock.sendMessage(jid, { text });
-    await appendToContext(jid, 'assistant', text, 'notice');
-    logger.info({ event: 'whatsapp.sent', to: jid, message: text });
-  } catch (error) {
-    logger.error({ event: 'whatsapp.send.failed', to: jid, error: error.message });
+    const safeText = typeof text === "string" ? text : String(text || "");
+    await sock.sendMessage(jid, { text: safeText, ...options });
+    await appendToContext(jid, 'assistant', safeText, 'text');
+  } catch (err) {
+    logger.error({ event: 'whatsapp.send.error', error: err.message });
   }
 }
 
-async function downloadMedia(message, type, jid) {
-  logger.info({ event: 'media.download.start', from: jid, type });
-  const stream = await downloadContentFromMessage(message, type);
-  let buffer = Buffer.from([]);
-  for await (const chunk of stream) {
-    buffer = Buffer.concat([buffer, chunk]);
-  }
-  logger.info({ event: 'media.download.success', from: jid, size: buffer.length });
-  return buffer;
-}
-
-async function opusToMp3(opusBuffer) {
-  await ensureTempDir();
-  const inputPath = path.join(TEMP_DIR, `audio-${Date.now()}.opus`);
-  const outputPath = path.join(TEMP_DIR, `audio-${Date.now()}.mp3`);
-
-  return new Promise((resolve, reject) => {
-    fssync.writeFile(inputPath, opusBuffer, (err) => {
-      if (err) {
-        return reject(new Error(`Failed to write opus file: ${err.message}`));
-      }
-      
-      ffmpeg(inputPath)
-        .output(outputPath)
-        .audioCodec('libmp3lame')
-        .on('end', async () => {
-          await fs.unlink(inputPath).catch(() => {});
-          resolve(outputPath);
-        })
-        .on('error', async (err) => {
-          await fs.unlink(inputPath).catch(() => {});
-          await fs.unlink(outputPath).catch(() => {});
-          reject(new Error(`FFmpeg failed: ${err.message}`));
-        })
-        .run();
-    });
-  });
-}
-
-async function processMessage(message, from) {
-  logger.info({ event: 'message.received', from });
-
-  const now = dayjs().tz('America/Sao_Paulo');
+async function handleMessage(msg) {
+  const from = msg.key.remoteJid;
   let text = '';
   let origin = 'text';
 
-  // Texto normal
-  if (message.conversation || message.extendedTextMessage?.text) {
-    text = (message.conversation || message.extendedTextMessage.text).trim();
-    origin = 'text';
-    if (!text) return;
-  }
-
-  // Áudio
-  else if (message.audioMessage) {
-    logger.info({ event: 'audio.received', from, seconds: message.audioMessage.seconds });
-    await sock.sendPresenceUpdate('composing', from);
-    let mp3Path = null;
-    try {
-      const buffer = await downloadMedia(message.audioMessage, 'audio', from);
-      mp3Path = await opusToMp3(buffer);
-      const transcription = await transcribeAudio(mp3Path);
-      if (!transcription) {
-        await sendMessage(from, "Não entendi seu áudio. Pode repetir?");
-        return;
-      }
-      text = transcription;
-      origin = 'audio';
-    } catch (err) {
-      logger.error({ event: 'audio.process.failed', error: err.message });
-      await sendMessage(from, "Desculpe, não consegui transcrever seu áudio.");
-      return;
-    } finally {
-      if (mp3Path) {
-        await fs.unlink(mp3Path).catch(() => {});
-      }
-    }
-  }
-
-  // Imagem
-  else if (message.imageMessage) {
-    logger.info({ event: 'image.received', from });
-    await sock.sendPresenceUpdate('composing', from);
-    const imagePath = path.join(TEMP_DIR, `img-${Date.now()}.jpg`);
-    try {
-      const buffer = await downloadMedia(message.imageMessage, 'image', from);
-      await fs.writeFile(imagePath, buffer);
-      const description = await analyzeImage(imagePath);
-      text = description;
-      origin = 'image';
-      await sendMessage(from, text);
-    } catch (err) {
-      logger.error({ event: 'image.process.failed', error: err.message });
-      await sendMessage(from, "Não consegui analisar sua imagem. 😥");
-      return;
-    } finally {
-      await fs.unlink(imagePath).catch(() => {});
-    }
-  }
-
-  // Documento (PDF, Office, HTML, etc)
-  else if (message.documentMessage) {
-    logger.info({ event: 'document.received', from, mimetype: message.documentMessage.mimetype });
-    await sock.sendPresenceUpdate('composing', from);
-    const docPath = path.join(TEMP_DIR, `doc-${Date.now()}`);
-    try {
-      const buffer = await downloadMedia(message.documentMessage, 'document', from);
-      await fs.writeFile(docPath, buffer);
-
-      const rawText = await extractAnyText(docPath, message.documentMessage.mimetype);
-
-      if (!rawText.trim()) {
-        await sendMessage(from, "📄 Não consegui extrair conteúdo legível desse arquivo.");
-        return;
-      }
-
-      const summary = await summarizeDocument(rawText.slice(0, 4000));
-      const summaryTextForLog = `[Documento resumido] ${summary}`;
-      origin = 'document';
-
-      // Salva no contexto o texto sem a tag
-      await appendToContext(from, "user", summary, "document");
-      await appendToContext(from, "user", rawText.slice(0, 10000), "doc_raw");
-
-      // Envia a resposta com a tag
-      await sendMessage(from, summaryTextForLog);
-      
-      logger.info({ event: 'document.summarized', text: summaryTextForLog });
-    } catch (err) {
-      logger.error({ event: 'document.process.failed', error: err.message });
-      await sendMessage(from, "Erro ao processar o documento.");
-      return;
-    } finally {
-      await fs.unlink(docPath).catch(() => {});
-    }
-  }
-
-  else {
+  if (msg.message?.extendedTextMessage?.text) {
+    text = msg.message.extendedTextMessage.text;
+  } else if (msg.message?.conversation) {
+    text = msg.message.conversation;
+  } else if (msg.message?.imageMessage) {
+    text = msg.message.imageMessage?.caption || '';
+    origin = 'image';
+  } else if (msg.message?.audioMessage) {
+    origin = 'audio';
+  } else if (msg.message?.documentMessage) {
+    origin = 'document';
+    text = msg.message.documentMessage?.caption || '';
+  } else if (msg.message?.videoMessage) {
+    text = msg.message.videoMessage?.caption || '';
+    origin = 'video';
+  } else if (msg.message?.buttonsResponseMessage?.selectedDisplayText) {
+    text = msg.message.buttonsResponseMessage.selectedDisplayText;
+  } else if (msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId) {
+    text = msg.message.listResponseMessage.singleSelectReply.selectedRowId;
+  } else {
+    logger.warn({ event: 'unsupported.message', type: Object.keys(msg.message || {})[0] });
     return;
   }
 
-  // === Salvar no contexto e Logar ===
-  if (origin !== 'document' && origin !== 'image') { // Documento e imagem já lidam com isso
-    const loggableText = (origin === 'audio')
-      ? `[Áudio processado] ${text}`
-      : text;
-    
-    await appendToContext(from, 'user', text, origin);
-    logger.info({ event: `${origin}.processed`, text: loggableText });
-  }
+  text = typeof text === "string" ? text : String(text || "");
+  logger.info({ event: 'message.received', from, origin, text });
+  await appendToContext(from, 'user', text, origin);
 
-  // === Fluxo principal ===
-  
-  if (/(listar|meus) lembretes/i.test(text)) {
+  // ⚡ Sempre mostrar "digitando..." enquanto processa
+  await sock.sendPresenceUpdate('composing', from);
+
+  // === Comando: listar lembretes ===
+  if (["!lembretes", "listar lembretes", "meus lembretes", "listar"].includes(text.toLowerCase())) {
     const reminders = await getUserReminders(from);
-    if (reminders.length === 0) {
-      await sendMessage(from, "Você não tem lembretes ativos.");
+    if (reminders.length > 0) {
+      const reminderList = reminders
+        .map(r => `- ${r.content} ⏰ ${dayjs(r.scheduledAt).format('DD/MM/YYYY [às] HH:mm')}`)
+        .join('\n');
+
+      return sendMessage(from, `📋 Aqui estão seus lembretes ativos:\n\n${reminderList}\n\nO que deseja fazer agora?`, {
+        buttons: [
+          { buttonId: 'novo', buttonText: { displayText: '➕ Novo lembrete' }, type: 1 },
+          { buttonId: 'limpar', buttonText: { displayText: '🗑️ Limpar todos' }, type: 1 }
+        ],
+        headerType: 1
+      });
     } else {
-      const list = reminders.map((r, i) =>
-        `📌 ${i + 1}. ${r.content} - ${dayjs(r.scheduledAt).tz('America/Sao_Paulo').format("DD/MM [às] HH:mm")}`
-      ).join("\n");
-      await sendMessage(from, `📋 Seus lembretes:\n${list}`);
+      return sendMessage(from, '🔕 Você ainda não tem lembretes ativos.\nQuer criar um agora? Basta me dizer, por exemplo:\n\n👉 "Me lembre amanhã às 9h de beber água 💧"');
     }
-    return;
   }
 
-  if (/(apagar|remover|excluir) (meus |os |todos os |)lembretes/i.test(text)) {
+  // === Comando: apagar lembretes ===
+  if (["!limpar-lembretes", "limpar"].includes(text.toLowerCase())) {
     await clearUserReminders(from);
-    await sendMessage(from, "🗑️ Seus lembretes foram apagados.");
-    return;
+    return sendMessage(from, '✅ Todos os seus lembretes foram apagados.');
   }
 
-  if (/^pesquisar (.+)$/i.test(text)) {
-    const query = text.match(/^pesquisar (.+)$/i)[1];
-    const result = await webSearch(query);
-    await sendMessage(from, `🔎 Resultado da pesquisa:\n${result}`);
-    return;
-  }
+  // === Processar mídias ===
+  if (origin !== 'text' && msg.message[origin + "Message"]) {
+    const mediaPath = path.join(TEMP_DIR, `media-${msg.key.id}`);
+    const mimetype = msg.message[origin + "Message"].mimetype;
+    const extension = mime.extension(mimetype) || 'bin';
+    const filePath = `${mediaPath}.${extension}`;
+    const stream = await downloadContentFromMessage(msg.message[origin + "Message"], origin);
 
-  const parsed = await extractReminder(text, now);
-  if (parsed.shouldRemind) {
-    if (parsed.date && parsed.time) {
-      const alert = await generateReminderAlert(parsed.content);
-      const reminder = {
-        from: from,
-        content: parsed.content,
-        date: parsed.date,
-        time: parsed.time,
-        timezone: parsed.timezone || 'America/Sao_Paulo',
-      };
-      await scheduleReminder(reminder, () => sendMessage(from, alert));
-      const scheduledTime = dayjs.tz(`${parsed.date} ${parsed.time}`, 'YYYY-MM-DD HH:mm', parsed.timezone || 'America/Sao_Paulo');
-      await sendMessage(from, `✅ Agendei seu lembrete: *${parsed.content}* em ${scheduledTime.format("DD/MM [às] HH:mm")}`);
-      return;
+    let buffer = Buffer.from([]);
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+    await fs.writeFile(filePath, buffer);
+
+    try {
+      if (origin === 'audio') {
+        const mp3Path = `${mediaPath}.mp3`;
+        await new Promise((resolve, reject) => {
+          ffmpeg(filePath)
+            .audioCodec('libmp3lame')
+            .on('error', reject)
+            .on('end', resolve)
+            .save(mp3Path);
+        });
+        text = await transcribeAudio(mp3Path);
+        await fs.unlink(filePath).catch(() => {});
+        await fs.unlink(mp3Path).catch(() => {});
+      } else if (origin === 'document' || origin === 'image') {
+        const fileText = await extractAnyText(filePath, mimetype);
+        if (fileText) text = await summarizeDocument(fileText);
+        await fs.unlink(filePath).catch(() => {});
+      }
+    } catch (err) {
+      logger.error({ event: 'media.process.error', error: err.message });
+      return sendMessage(from, "⚠️ Não consegui processar esse arquivo. Pode tentar novamente?");
     }
   }
 
-  // Chat normal
-  const reply = await chatResponse(text, from);
-  await sendMessage(from, reply);
+  // === Lembretes ===
+  const reminder = await extractReminder(text, from);
+  if (reminder?.shouldRemind) {
+    const scheduledAt = dayjs(`${reminder.date} ${reminder.time}`).tz(reminder.timezone, true);
+    if (scheduledAt.isValid() && scheduledAt.isAfter(dayjs())) {
+      const alert = await generateReminderAlert(reminder.content);
+      const reminderObj = { from, ...reminder, scheduledAt: scheduledAt.toISOString() };
+      await scheduleReminder(reminderObj, async (to, content) => {
+        await sendMessage(to, content);
+      });
+      return sendMessage(from, `✅ Lembrete criado com sucesso!\n⏰ Está agendado para ${scheduledAt.format('DD/MM/YYYY [às] HH:mm')}.`, {
+        buttons: [
+          { buttonId: 'novo', buttonText: { displayText: '➕ Novo lembrete' }, type: 1 },
+          { buttonId: 'listar', buttonText: { displayText: '📋 Ver lembretes' }, type: 1 }
+        ],
+        headerType: 1
+      });
+    } else {
+      return sendMessage(from, "⚠️ Não consegui agendar o lembrete. Verifique se a data e a hora estão corretas.");
+    }
+  }
+
+  // === Chat normal ===
+  try {
+    const reply = await chatResponse(text, from);
+    await sendMessage(from, reply);
+  } catch (err) {
+    logger.error({ event: 'chat.error', from, error: err.message });
+    await sendMessage(from, "❌ Ocorreu um erro ao tentar responder. Pode repetir sua pergunta?");
+  }
 }
 
 async function startBot() {
   logger.info('🚀 Inicializando bot de lembretes no WhatsApp...');
   await ensureTempDir();
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  const { state } = await useMultiFileAuthState('auth_info_baileys');
   sock = makeWASocket({ auth: state });
 
   sock.ev.process(async (events) => {
@@ -256,11 +183,12 @@ async function startBot() {
         qrcode.generate(qr, { small: true });
       }
       if (connection === 'close') {
-        const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         logger.warn({ event: 'connection.closed', reconnect: shouldReconnect });
         if (shouldReconnect) startBot();
       } else if (connection === 'open') {
         logger.info('✅ Conectado ao WhatsApp!');
+        console.log("🤖 Bot pronto para receber mensagens!");
       }
     }
 
@@ -270,12 +198,13 @@ async function startBot() {
       for (const msg of upsert.messages) {
         if (msg.key.fromMe) continue;
         const from = msg.key.remoteJid;
-        await processMessage(msg.message, from);
+        try {
+          await handleMessage(msg);
+        } catch (err) {
+          logger.error({ event: 'message.handler.error', from, error: err.message });
+          sendMessage(from, "❌ Ocorreu um erro inesperado ao processar sua mensagem. Pode tentar novamente?");
+        }
       }
-    }
-
-    if (events['creds.update']) {
-      await saveCreds();
     }
   });
 }

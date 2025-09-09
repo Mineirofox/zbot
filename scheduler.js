@@ -36,12 +36,8 @@ async function scheduleReminder(reminder, sendFn) {
   const reminders = await loadReminders();
   reminder.id = Date.now().toString();
 
-  // CORREÇÃO: Usar formato de parsing explícito
-  reminder.scheduledAt = dayjs.tz(
-    `${reminder.date} ${reminder.time}`,
-    'YYYY-MM-DD HH:mm',
-    reminder.timezone
-  ).toISOString();
+  const scheduledTime = dayjs(`${reminder.date} ${reminder.time}`).tz(reminder.timezone, true);
+  reminder.scheduledAt = scheduledTime.toISOString();
 
   reminders.push(reminder);
   await saveReminders(reminders);
@@ -56,7 +52,7 @@ function _armReminder(reminder, sendFn) {
   if (delay > 0) {
     setTimeout(async () => {
       try {
-        await sendFn(reminder.from, reminder.content);
+        await sendFn(reminder.from, `⏰ Lembrete: ${reminder.content}`);
       } catch (err) {
         logger.error({ event: 'reminder.send.failed', error: err.message });
       }
@@ -90,19 +86,17 @@ async function getUserReminders(jid) {
       time: r.time,
       timezone: r.timezone,
       scheduledAt: r.scheduledAt
-    }))
-    .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+    }));
 }
 
 async function clearUserReminders(jid) {
-  const reminders = await loadReminders();
-  const filtered = reminders.filter(r => r.from !== jid);
-  await saveReminders(filtered);
+  const reminders = (await loadReminders()).filter(r => r.from !== jid);
+  await saveReminders(reminders);
 }
 
 module.exports = {
   scheduleReminder,
   reloadAllReminders,
   getUserReminders,
-  clearUserReminders
+  clearUserReminders,
 };

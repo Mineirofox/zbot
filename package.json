@@ -24,9 +24,7 @@
     "mammoth": "^1.6.0",
     "unzipper": "^0.11.3",
     "xml2js": "^0.6.2",
-    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.2/xlsx-0.20.2.tgz"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.2/xlsx-0.20.2.tgz",
+    "link-preview-js": "^3.0.0"
   }
 }
