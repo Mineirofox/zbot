@@ -14,6 +14,7 @@ async function loadContexts() {
     const data = await fs.readFile(CONTEXTS_FILE, "utf-8");
     return JSON.parse(data);
   } catch {
+    logger.warnWithContext("context.load", { message: "Nenhum contexto salvo." });
     return {};
   }
 }
@@ -35,7 +36,6 @@ async function appendToContext(userId, role, content, origin = "text") {
     contexts[userId] = [];
   }
 
-  // garantir que content seja string
   const safeContent = typeof content === "string" ? content : String(content || "");
 
   contexts[userId].push({

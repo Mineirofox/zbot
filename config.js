@@ -3,8 +3,13 @@ require('dotenv').config();
 function requireEnv(name, fallback = null) {
   const value = process.env[name] || fallback;
   if (!value) {
-    console.error(`❌ ERRO: Variável de ambiente "${name}" não está definida no .env`);
-    process.exit(1);
+    if (process.env.NODE_ENV === "production") {
+      console.error(`❌ ERRO: Variável de ambiente "${name}" não está definida no .env`);
+      process.exit(1);
+    } else {
+      console.warn(`⚠️ AVISO: Variável de ambiente "${name}" não definida, usando fallback.`);
+      return fallback;
+    }
   }
   return value;
 }

@@ -11,3 +11,5 @@ Thumbs.db
 reminders.json
 *.mp3
 *.opus
+contexts.json
+contacts.json

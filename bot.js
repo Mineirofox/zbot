@@ -7,14 +7,16 @@ const {
 
 const {
   extractReminder,
+  extractForwardMessage,
   chatResponse,
   transcribeAudio,
   generateReminderAlert,
   summarizeDocument,
   extractAnyText
 } = require('./openai');
-const { scheduleReminder, getUserReminders, clearUserReminders } = require('./scheduler');
+const { scheduleReminder, getUserReminders, clearUserReminders, saveReminders, loadReminders } = require('./scheduler');
 const { appendToContext } = require('./contextManager');
+const { setContact, getContact, listContacts, removeContact } = require('./contactsManager');
 const logger = require('./logger');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
@@ -68,6 +70,18 @@ async function sendMessage(jid, text, options = {}) {
   }
 }
 
+// 🔥 Helper para efeito de digitando
+function startComposing(from) {
+  sock.sendPresenceUpdate('composing', from).catch(() => {});
+  return setInterval(() => {
+    sock.sendPresenceUpdate('composing', from).catch(() => {});
+  }, 4000);
+}
+async function stopComposing(interval, from) {
+  clearInterval(interval);
+  await sock.sendPresenceUpdate('paused', from).catch(() => {});
+}
+
 async function handleMessage(msg) {
   const from = msg.key.remoteJid;
   let text = '';
@@ -103,9 +117,40 @@ async function handleMessage(msg) {
     logger.infoWithContext('message.received', { from, origin, textPreview: text.slice(0, 80) });
 
     await appendToContext(from, 'user', text, origin);
-    await sock.sendPresenceUpdate('composing', from);
 
-    // === LISTAR LEMBRETES (detecção flexível) ===
+    // === CONTATOS ===
+    if (text.toLowerCase().startsWith("!estabelecer")) {
+      const match = text.match(/!estabelecer\s+(\d+)\s+como\s+(.+)/i);
+      if (!match) {
+        return sendMessage(from, "❌ Uso incorreto. Exemplo: *!estabelecer 33999999999 como Fulano*");
+      }
+      const [, number, alias] = match;
+      await setContact(alias, number + "@s.whatsapp.net");
+      return sendMessage(from, `✅ Contato salvo: *${alias}* → ${number}`);
+    }
+
+    if (text.toLowerCase() === "!contatos") {
+      const contacts = await listContacts();
+      if (Object.keys(contacts).length === 0) {
+        return sendMessage(from, "📭 Nenhum contato salvo.");
+      }
+      const list = Object.entries(contacts)
+        .map(([alias, jid], i) => `#️⃣ ${i + 1} → *${alias}* (${jid.replace("@s.whatsapp.net","")})`)
+        .join("\n");
+      return sendMessage(from, "📇 *Contatos salvos:*\n" + list);
+    }
+
+    if (text.toLowerCase().startsWith("!remover-contato")) {
+      const parts = text.split(" ");
+      if (parts.length < 2) {
+        return sendMessage(from, "❌ Exemplo: *!remover-contato Fulano*");
+      }
+      const alias = parts.slice(1).join(" ");
+      await removeContact(alias);
+      return sendMessage(from, `🗑️ Contato *${alias}* removido.`);
+    }
+
+    // === LISTAR LEMBRETES ===
     if (/\blembretes?\b/i.test(text) || /^!lembretes\b/i.test(text)) {
       const reminders = await getUserReminders(from);
       if (reminders.length > 0) {
@@ -153,13 +198,81 @@ async function handleMessage(msg) {
       }
 
       const toDelete = reminders[index];
-      const all = await getUserReminders(from);
+      const all = await loadReminders();
       const left = all.filter(r => r.id !== toDelete.id);
-
-      await fs.writeFile('./reminders.json', JSON.stringify(left, null, 2));
+      await saveReminders(left);
 
       logger.infoWithContext('reminder.deleted', { from, deleted: toDelete.content });
       return sendMessage(from, `🗑️ Lembrete removido: *${toDelete.content}*`);
+    }
+
+    // === lembretes automáticos ===
+    const reminder = await extractReminder(text, from);
+    const isReminderLike = /\b(me\s+lembre|me\s+lembrar|me\s+notifique|me\s+avise)\b/i.test(text);
+
+    if (reminder?.shouldRemind && isReminderLike) {
+      const scheduledAt = dayjs(`${reminder.date} ${reminder.time}`).tz(reminder.timezone, true);
+      if (scheduledAt.isValid() && scheduledAt.isAfter(dayjs())) {
+        const alert = await generateReminderAlert(reminder.content);
+        const reminderObj = { from, ...reminder, scheduledAt: scheduledAt.toISOString() };
+        await scheduleReminder(reminderObj, async (to, content) => {
+          await sendMessage(to, content);
+        });
+        logger.infoWithContext('reminder.scheduled', { from, at: scheduledAt.toString(), content: reminder.content });
+        return sendMessage(from, `✅ *Lembrete criado!* ⏰\n${scheduledAt.format('DD/MM/YYYY [às] HH:mm')}`);
+      } else {
+        logger.warnWithContext('reminder.invalid', { from, reminder });
+        return sendMessage(from, "⚠️ Não consegui agendar o lembrete. Verifique a data/hora.");
+      }
+    }
+
+    // === envio de mensagem para outro contato ===
+    const fwd = await extractForwardMessage(text, from);
+    if (fwd?.shouldSend) {
+      let contactJid = await getContact(fwd.recipient);
+      if (!contactJid) {
+        return sendMessage(from, `❌ Contato *${fwd.recipient}* não encontrado. Cadastre com: *!estabelecer <número> como ${fwd.recipient}*`);
+      }
+
+      const scheduledAt = dayjs(`${fwd.date} ${fwd.time}`).tz(fwd.timezone, true);
+      if (!scheduledAt.isValid() || !scheduledAt.isAfter(dayjs())) {
+        return sendMessage(from, "⚠️ Data/hora inválida para envio.");
+      }
+
+      // === identificar apelido do remetente ===
+      let aliasFrom = null;
+      const allContacts = await listContacts();
+      for (const [nickname, jid] of Object.entries(allContacts)) {
+        if (jid === from) {
+          aliasFrom = nickname;
+          break;
+        }
+      }
+      if (!aliasFrom) {
+        aliasFrom = from.replace(/@s\.whatsapp\.net$/, "");
+      }
+
+      const reminderObj = {
+        from: from,
+        recipient: contactJid,
+        content: fwd.content,
+        fromAlias: aliasFrom,
+        date: fwd.date,
+        time: fwd.time,
+        timezone: fwd.timezone,
+      };
+
+      await scheduleReminder(
+        reminderObj,
+        async (targetJid, content) => {
+          await sendMessage(targetJid, content);
+        },
+        async (creatorJid, sentReminder) => {
+          await sendMessage(creatorJid, `✅ Sua mensagem para ${fwd.recipient} foi entregue.`);
+        }
+      );
+
+      return sendMessage(from, `📩 *Mensagem agendada para ${fwd.recipient}!* ⏰\n${scheduledAt.format('DD/MM/YYYY [às] HH:mm')}`);
     }
 
     // === processamento de mídias ===
@@ -168,12 +281,16 @@ async function handleMessage(msg) {
       const mimetype = msg.message[origin + "Message"].mimetype;
       const extension = mime.extension(mimetype) || 'bin';
       const filePath = `${mediaPath}.${extension}`;
+
       const stream = await downloadContentFromMessage(msg.message[origin + "Message"], origin);
+      const writable = require("fs").createWriteStream(filePath);
 
-      let buffer = Buffer.from([]);
-      for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-      await fs.writeFile(filePath, buffer);
+      for await (const chunk of stream) {
+        writable.write(chunk);
+      }
+      writable.end();
 
+      const composingInterval = startComposing(from);
       try {
         if (origin === 'audio') {
           const mp3Path = `${mediaPath}.mp3`;
@@ -197,34 +314,25 @@ async function handleMessage(msg) {
           await fs.unlink(filePath).catch(() => {});
         }
       } catch (err) {
+        await stopComposing(composingInterval, from);
         logger.errorWithContext('media.process.error', err);
         return sendMessage(from, "⚠️ Não consegui processar esse arquivo. Pode tentar novamente?");
       }
-    }
-
-    // === lembretes automáticos extraídos ===
-    const reminder = await extractReminder(text, from);
-    if (reminder?.shouldRemind) {
-      const scheduledAt = dayjs(`${reminder.date} ${reminder.time}`).tz(reminder.timezone, true);
-      if (scheduledAt.isValid() && scheduledAt.isAfter(dayjs())) {
-        const alert = await generateReminderAlert(reminder.content);
-        const reminderObj = { from, ...reminder, scheduledAt: scheduledAt.toISOString() };
-        await scheduleReminder(reminderObj, async (to, content) => {
-          await sendMessage(to, content);
-        });
-        logger.infoWithContext('reminder.scheduled', { from, at: scheduledAt.toString(), content: reminder.content });
-        return sendMessage(from, `✅ Lembrete criado!\n⏰ ${scheduledAt.format('DD/MM/YYYY [às] HH:mm')}`);
-      } else {
-        logger.warnWithContext('reminder.invalid', { from, reminder });
-        return sendMessage(from, "⚠️ Não consegui agendar o lembrete. Verifique a data/hora.");
-      }
+      await stopComposing(composingInterval, from);
     }
 
     // === resposta normal ===
     try {
       logger.infoWithContext('chatResponse.start', { from });
+      const composingInterval = startComposing(from);
+
       const reply = await chatResponse(text, from);
-      await sendMessage(from, reply);
+
+      await stopComposing(composingInterval, from);
+
+      if (reply && reply.trim()) {
+        await sendMessage(from, reply);
+      }
       logger.infoWithContext('chatResponse.success', { from });
     } catch (err) {
       logger.errorWithContext('chatResponse.error', err);
