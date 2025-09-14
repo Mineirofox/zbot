@@ -1,19 +1,30 @@
 const makeWASocket = require("@whiskeysockets/baileys").default;
 const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const pino = require("pino");
-const fs = require("fs");
-const path = require("path");
 const logger = require("./logger");
 const { scheduleReminder, restoreReminders } = require("./scheduler");
 const { chatResponse, extractReminder, extractForwardMessage } = require("./openai");
 const { setContact, getContact } = require("./contactsManager");
-const { clearContext } = require("./contextManager");
+const dayjs = require("dayjs");
 
-if (process.platform === 'win32') {
-  const exec = require('child_process').exec;
+// === helpers de digitação ===
+function startComposing(sock, jid) {
+  sock.sendPresenceUpdate("composing", jid).catch(() => {});
+  return setInterval(() => {
+    sock.sendPresenceUpdate("composing", jid).catch(() => {});
+  }, 4000);
+}
+
+async function stopComposing(sock, interval, jid) {
+  clearInterval(interval);
+  await sock.sendPresenceUpdate("paused", jid).catch(() => {});
+}
+
+if (process.platform === "win32") {
+  const exec = require("child_process").exec;
   const cmd = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8';
   exec(`powershell -Command \"${cmd}\"`, (error) => {
-    if (!error) console.log('[ENCODING] UTF-8 ativado ✔');
+    if (!error) console.log("[ENCODING] UTF-8 ativado ✔");
   });
 }
 
@@ -37,15 +48,18 @@ async function startBot() {
       // 🔥 restaura lembretes apenas quando a conexão abre
       await restoreReminders(
         async (to, content) => {
+          const typing = startComposing(sock, to);
           await sock.sendMessage(to, { text: content });
+          await stopComposing(sock, typing, to);
         },
         async (creator, reminderObj) => {
+          const typing = startComposing(sock, creator);
           await sock.sendMessage(creator, {
             text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
           });
+          await stopComposing(sock, typing, creator);
         }
       );
-
     } else if (connection === "close") {
       logger.error({ event: "connection.close", lastDisconnect });
       startBot();
@@ -71,57 +85,76 @@ async function startBot() {
       await setContact(m.pushName, from);
     }
 
-    // primeiro tenta extrair mensagem para terceiro
-    const forward = await extractForwardMessage(text, from);
-    if (forward?.shouldSend) {
-      const recipientJid = await getContact(forward.recipient);
-      if (!recipientJid) {
-        await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.` });
+    const typing = startComposing(sock, from);
+
+    try {
+      // primeiro tenta extrair mensagem para terceiro
+      const forward = await extractForwardMessage(text, from);
+      if (forward?.shouldSend) {
+        const recipientJid = await getContact(forward.recipient);
+        if (!recipientJid) {
+          await stopComposing(sock, typing, from);
+          await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.` });
+          return;
+        }
+
+        await scheduleReminder(
+          {
+            from,
+            recipient: recipientJid,
+            date: forward.date,
+            time: forward.time,
+            timezone: forward.timezone,
+            content: forward.content,
+          },
+          async (to, content) => {
+            const typingFwd = startComposing(sock, to);
+            await sock.sendMessage(to, { text: content });
+            await stopComposing(sock, typingFwd, to);
+          }
+        );
+        await stopComposing(sock, typing, from);
+        await sock.sendMessage(from, {
+          text: `📨 Mensagem agendada para ${forward.recipient}.`,
+        });
         return;
       }
 
-      await scheduleReminder(
-        {
-          from,
-          recipient: recipientJid,
-          date: forward.date,
-          time: forward.time,
-          timezone: forward.timezone,
-          content: forward.content,
-        },
-        async (to, content) => {
-          await sock.sendMessage(to, { text: content });
-        }
-      );
-      await sock.sendMessage(from, {
-        text: `📨 Mensagem agendada para ${forward.recipient}.`,
-      });
-      return;
-    }
+      // tenta extrair lembrete pessoal
+      const reminder = await extractReminder(text, from);
+      if (reminder?.shouldRemind) {
+        await scheduleReminder(
+          { from, ...reminder },
+          async (to, content) => {
+            const typingRem = startComposing(sock, to);
+            await sock.sendMessage(to, { text: content });
+            await stopComposing(sock, typingRem, to);
+          },
+          async (creator, reminderObj) => {
+            const typingConf = startComposing(sock, creator);
+            await sock.sendMessage(creator, {
+              text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
+            });
+            await stopComposing(sock, typingConf, creator);
+          }
+        );
+        await stopComposing(sock, typing, from);
+        await sock.sendMessage(from, {
+          text: `⏰ Lembrete agendado para ${reminder.date} às ${reminder.time}.`,
+        });
+        return;
+      }
 
-    // tenta extrair lembrete pessoal
-    const reminder = await extractReminder(text, from);
-    if (reminder?.shouldRemind) {
-      await scheduleReminder(
-        { from, ...reminder },
-        async (to, content) => {
-          await sock.sendMessage(to, { text: content });
-        },
-        async (creator, reminderObj) => {
-          await sock.sendMessage(creator, {
-            text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
-          });
-        }
-      );
-      await sock.sendMessage(from, {
-        text: `⏰ Lembrete agendado para ${reminder.date} às ${reminder.time}.`,
-      });
-      return;
-    }
+      // se não for lembrete nem mensagem para terceiros → resposta normal
+      const reply = await chatResponse(text, from);
+      await stopComposing(sock, typing, from);
+      await sock.sendMessage(from, { text: reply });
 
-    // se não for lembrete nem mensagem para terceiros → resposta normal
-    const reply = await chatResponse(text, from);
-    await sock.sendMessage(from, { text: reply });
+    } catch (err) {
+      await stopComposing(sock, typing, from);
+      logger.errorWithContext("messages.upsert.error", err);
+      await sock.sendMessage(from, { text: "⚠️ Erro ao processar sua mensagem." });
+    }
   });
 
   logger.info({ event: "bot.start" });
