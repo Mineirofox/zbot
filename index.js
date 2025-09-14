@@ -3,7 +3,7 @@ const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const logger = require("./logger");
 const { scheduleReminder, restoreReminders } = require("./scheduler");
-const { chatResponse, extractReminder, extractForwardMessage, humanizeForwardedMessage } = require("./openai");
+const { chatResponse, extractReminder, extractForwardMessage } = require("./openai");
 const { setContact, getContact } = require("./contactsManager");
 
 // === helpers de digitação ===
@@ -44,15 +44,10 @@ async function startBot() {
     if (connection === "open") {
       logger.info({ event: "connection.open" });
 
-      // 🔥 restaura lembretes apenas quando a conexão abre
+      // 🔥 restaura lembretes (já humanizados pelo scheduler)
       await restoreReminders(
-        async (to, content, reminderObj) => {
+        async (to, finalMsg, reminderObj) => {
           const typing = startComposing(sock, to);
-          // humanizar se for mensagem para outro contato
-          let finalMsg = content;
-          if (reminderObj?.recipient && reminderObj?.fromAlias) {
-            finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
-          }
           await sock.sendMessage(to, { text: finalMsg });
           await stopComposing(sock, typing, to);
         },
@@ -98,7 +93,9 @@ async function startBot() {
         const recipientJid = await getContact(forward.recipient);
         if (!recipientJid) {
           await stopComposing(sock, typing, from);
-          await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.` });
+          await sock.sendMessage(from, {
+            text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.`,
+          });
           return;
         }
 
@@ -112,9 +109,8 @@ async function startBot() {
             content: forward.content,
             fromAlias: m.pushName || from.replace(/@s\.whatsapp\.net$/, ""), // quem pediu
           },
-          async (to, content, reminderObj) => {
+          async (to, finalMsg, reminderObj) => {
             const typingFwd = startComposing(sock, to);
-            const finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
             await sock.sendMessage(to, { text: finalMsg });
             await stopComposing(sock, typingFwd, to);
           },
@@ -126,6 +122,7 @@ async function startBot() {
             await stopComposing(sock, typingConf, creator);
           }
         );
+
         await stopComposing(sock, typing, from);
         await sock.sendMessage(from, {
           text: `📨 Mensagem agendada para ${forward.recipient}.`,
@@ -138,9 +135,9 @@ async function startBot() {
       if (reminder?.shouldRemind) {
         await scheduleReminder(
           { from, ...reminder },
-          async (to, content) => {
+          async (to, finalMsg) => {
             const typingRem = startComposing(sock, to);
-            await sock.sendMessage(to, { text: content });
+            await sock.sendMessage(to, { text: finalMsg });
             await stopComposing(sock, typingRem, to);
           },
           async (creator, reminderObj) => {

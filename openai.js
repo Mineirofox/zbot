@@ -187,7 +187,12 @@ async function extractForwardMessage(text, jid) {
 /* -------------------
    CHAT RESPONSE (com limpeza de links)
    ------------------- */
-async function chatResponse(text, jid) {
+async function chatResponse(text, jid, isScheduledMessage = false) {
+  // Se for mensagem agendada, não usar contexto nem pesquisa web
+  if (isScheduledMessage) {
+    return text; // Retorna a mensagem humanizada diretamente
+  }
+
   const context = await getContext(jid, text);
 
   try {
@@ -265,6 +270,9 @@ async function generateReminderAlert(reminderContent) {
   }
 }
 
+// ====================================================================
+// AQUI ESTÁ A FUNÇÃO CORRIGIDA
+// ====================================================================
 async function humanizeForwardedMessage(content, senderName) {
   if (!poe) return `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
   try {
@@ -273,15 +281,16 @@ async function humanizeForwardedMessage(content, senderName) {
       messages: [
         {
           role: 'system',
-          content: `Você é um assistente de recados. Sua tarefa é reescrever uma ÚNICA mensagem natural para ser enviada a pedido de outra pessoa.
-- Quem pediu o envio: ${senderName}.
-- Mensagem original: "${content}".
-- Saída: apenas UMA frase curta, amigável e clara, como se fosse o próprio remetente pedindo para avisar.
-- Proibido listar opções, tópicos, bullets ou variações.`
+          content: `Você é um sistema de formatação de mensagens. Sua única tarefa é reescrever a instrução do usuário em uma única frase curta e amigável, pronta para ser enviada.
+Sua resposta deve conter APENAS a frase final, sem "Ok", "aqui está", ou qualquer outra explicação ou comentário.
+
+Exemplo:
+- Usuário: Remetente: 'Carlos', Conteúdo: 'Diz pra Ana que a reunião de amanhã foi confirmada.'
+- Sua Resposta: Oi, Ana! O Carlos pediu para avisar que a reunião de amanhã foi confirmada.`
         },
-        { role: 'user', content: `Reescreva a mensagem de "${senderName}" para ser enviada a um terceiro. Conteúdo: "${content}"` }
+        { role: 'user', content: `Remetente: '${senderName}', Conteúdo: '${content}'` }
       ],
-      max_tokens: 200,
+      max_tokens: 150,
       temperature: 0.5,
     });
     return completion.choices[0]?.message?.content?.trim() || `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
@@ -290,6 +299,7 @@ async function humanizeForwardedMessage(content, senderName) {
     return `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
   }
 }
+// ====================================================================
 
 /* -------------------
    PESQUISA EM TEMPO REAL (com limpeza de links)
@@ -378,5 +388,5 @@ module.exports = {
   webSearch,
   summarizeDocument,
   extractAnyText,
-  humanizeForwardedMessage, // <-- Exportar a nova função
+  humanizeForwardedMessage,
 };
