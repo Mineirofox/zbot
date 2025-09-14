@@ -1,9 +1,8 @@
-// openai.js (ATUALIZADO - Gemini + limpeza de links com índices)
+// openai.js (completo e atualizado)
 const { OpenAI } = require("openai");
 const config = require("./config");
 const logger = require("./logger");
 const pdfParse = require("pdf-parse");
-const { getContext } = require("./contextManager");
 const mammoth = require("mammoth");
 const xlsx = require("xlsx");
 const { getLinkPreview } = require("link-preview-js");
@@ -14,6 +13,7 @@ const timezonePlugin = require("dayjs/plugin/timezone");
 dayjs.extend(utc);
 dayjs.extend(timezonePlugin);
 
+// clientes: OpenAI e POE (opcional)
 const openai = config.OPENAI_API_KEY ? new OpenAI({ apiKey: config.OPENAI_API_KEY }) : null;
 const poe = config.POE_API_KEY
   ? new OpenAI({ apiKey: config.POE_API_KEY, baseURL: "https://api.poe.com/v1" })
@@ -26,6 +26,7 @@ async function formatLinks(content) {
   if (!content) return "";
 
   let cleanContent = content;
+  // remover padrões estranhos de índices e referências
   cleanContent = cleanContent.replace(/\[\[(\d+)\]\]\([^)]+\)/g, "[$1]");
   cleanContent = cleanContent.replace(/\(\((\d+)\)\)/g, "[$1]");
   cleanContent = cleanContent.replace(/\[\[(\d+)\]\]\(\(\d+\)\)/g, "[$1]");
@@ -82,7 +83,7 @@ Você é um especialista em extrair lembretes de mensagens informais em portugu�
 
 Data e hora atuais: ${currentDateTime.format(
     "dddd, DD [de] MMMM [de] YYYY [às] HH:mm:ss"
-  )} (fuso: America/Sao_Paulo)
+  )} (fuso: ${config.DEFAULT_TIMEZONE})
 
 REGRAS IMPORTANTES:
 - Sempre converta expressões relativas ("daqui a 5 minutos", "amanhã às 10") em uma DATA e HORA ABSOLUTAS.
@@ -96,7 +97,7 @@ Responda apenas em JSON:
   "shouldRemind": boolean,
   "date": "YYYY-MM-DD" | null,
   "time": "HH:mm" | null,
-  "timezone": "America/Sao_Paulo",
+  "timezone": "${config.DEFAULT_TIMEZONE}",
   "content": "conteúdo do lembrete" | null
 }
 `;
@@ -104,7 +105,7 @@ Responda apenas em JSON:
 
 async function extractReminder(text, jid) {
   if (!poe) {
-    logger.warn("POE_API_KEY ausente, não é possível extrair lembretes.");
+    logger.warn("POE_API_KEY ausente, não é possível extrair lembretes automaticamente.");
     return null;
   }
   logger.info({ event: "openai.extractReminder.start" });
@@ -124,7 +125,7 @@ async function extractReminder(text, jid) {
     const jsonMatch = rawResponse.match(/\{[\s\S]*?\}/);
     return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
   } catch (err) {
-    logger.error({ event: "poe.extractReminder.error", error: err.message, text });
+    logger.error({ event: "poe.extractReminder.error", error: err.message || err, text });
     return null;
   }
 }
@@ -138,7 +139,7 @@ Você é um especialista em interpretar instruções para enviar mensagens para 
 
 Data e hora atuais: ${currentDateTime.format(
     "dddd, DD [de] MMMM [de] YYYY [às] HH:mm:ss"
-  )} (fuso: America/Sao_Paulo)
+  )} (fuso: ${config.DEFAULT_TIMEZONE})
 
 REGRAS IMPORTANTES:
 - Só ative "shouldSend": true se o usuário claramente pedir para enviar algo PARA OUTRO contato.
@@ -151,7 +152,7 @@ Responda apenas em JSON:
   "recipient": "nome do contato ou apelido mencionado",
   "date": "YYYY-MM-DD" | null,
   "time": "HH:mm" | null,
-  "timezone": "America/Sao_Paulo",
+  "timezone": "${config.DEFAULT_TIMEZONE}",
   "content": "conteúdo da mensagem para o destinatário"
 }
 `;
@@ -159,7 +160,7 @@ Responda apenas em JSON:
 
 async function extractForwardMessage(text, jid) {
   if (!poe) {
-    logger.warn("POE_API_KEY ausente, não é possível extrair mensagens para terceiros.");
+    logger.warn("POE_API_KEY ausente, não é possível extrair mensagens para terceiros automaticamente.");
     return null;
   }
   logger.info({ event: "openai.extractForwardMessage.start" });
@@ -179,7 +180,7 @@ async function extractForwardMessage(text, jid) {
     const jsonMatch = rawResponse.match(/\{[\s\S]*?\}/);
     return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
   } catch (err) {
-    logger.error({ event: "openai.extractForwardMessage.error", error: err.message, text });
+    logger.error({ event: "openai.extractForwardMessage.error", error: err.message || err, text });
     return null;
   }
 }
@@ -187,50 +188,54 @@ async function extractForwardMessage(text, jid) {
 /* -------------------
    CHAT RESPONSE (com limpeza de links)
    ------------------- */
-async function chatResponse(text, jid, isScheduledMessage = false) {
-  // Se for mensagem agendada, não usar contexto nem pesquisa web
-  if (isScheduledMessage) {
-    return text; // Retorna a mensagem humanizada diretamente
-  }
+async function chatResponse(text, jid) {
+  if (!text || !text.trim()) return null;
 
-  const context = await getContext(jid, text);
-
+  const context = []; // se quiser usar contexto, substitua por getContext(jid, text)
   try {
     if (poe) {
       logger.infoWithContext("chatResponse.poe.start", { from: jid });
       const completion = await poe.chat.completions.create({
         model: "Gemini-2.0-Flash",
-        messages: context,
+        messages: [
+          { role: "system", content: "Você é um assistente útil, responda em português de maneira clara e amigável." },
+          { role: "user", content: text },
+        ],
         max_tokens: 1000,
         temperature: 0.35,
       });
 
-      const reply = completion.choices?.[0]?.message?.content?.trim() || "";
+      const reply = completion.choices?.[0]?.message?.content?.trim() || null;
+      if (!reply) return null;
       const cleanReply = await formatLinks(reply);
-
       logger.infoWithContext("chatResponse.poe.success", { from: jid });
-      return cleanReply || "⚠️ Sem resposta.";
+      return cleanReply || null;
     }
 
     if (openai) {
       logger.infoWithContext("chatResponse.openai.start", { from: jid });
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
-        messages: context,
+        messages: [
+          { role: "system", content: "Você é um assistente útil, responda em português de maneira clara e amigável." },
+          { role: "user", content: text },
+        ],
         max_tokens: 500,
         temperature: 0.5,
       });
-      const reply = completion.choices?.[0]?.message?.content?.trim() || "⚠️ Sem resposta.";
-      const cleanReply = await formatLinks(reply);
 
+      const reply = completion.choices?.[0]?.message?.content?.trim() || null;
+      if (!reply) return null;
+      const cleanReply = await formatLinks(reply);
       logger.infoWithContext("chatResponse.openai.success", { from: jid });
-      return cleanReply;
+      return cleanReply || null;
     }
 
-    return "⚠️ Serviço de IA indisponível.";
+    logger.warn("Serviço de IA indisponível.");
+    return null;
   } catch (err) {
     logger.errorWithContext("chatResponse.error", err);
-    return "⚠️ Erro ao gerar resposta.";
+    return null;
   }
 }
 
@@ -238,7 +243,7 @@ async function chatResponse(text, jid, isScheduledMessage = false) {
    TRANSCRIÇÃO / SUMMARIZE / EXTRAÇÃO
    ------------------- */
 async function transcribeAudio(filePath) {
-  if (!openai) return "⚠️ Serviço de IA indisponível.";
+  if (!openai) return "";
   try {
     const res = await openai.audio.transcriptions.create({
       file: require("fs").createReadStream(filePath),
@@ -246,7 +251,7 @@ async function transcribeAudio(filePath) {
     });
     return res.text || "";
   } catch (err) {
-    logger.error({ event: "audio.transcribe.error", error: err.message });
+    logger.error({ event: "audio.transcribe.error", error: err.message || err });
     return "";
   }
 }
@@ -265,41 +270,55 @@ async function generateReminderAlert(reminderContent) {
     });
     return completion.choices[0]?.message?.content?.trim() || `⏰ ${reminderContent}`;
   } catch (err) {
-    logger.warn({ event: 'openai.generateReminderAlert.error', error: err.message });
+    logger.warn({ event: 'openai.generateReminderAlert.error', error: err.message || err });
     return `⏰ Lembrete: ${reminderContent}`;
   }
 }
 
-// ====================================================================
-// AQUI ESTÁ A FUNÇÃO CORRIGIDA
-// ====================================================================
 async function humanizeForwardedMessage(content, senderName) {
-  if (!poe) return `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
-  try {
-    const completion = await poe.chat.completions.create({
-      model: 'Gemini-2.0-Flash',
-      messages: [
-        {
-          role: 'system',
-          content: `Você é um sistema de formatação de mensagens. Sua única tarefa é reescrever a instrução do usuário em uma única frase curta e amigável, pronta para ser enviada.
-Sua resposta deve conter APENAS a frase final, sem "Ok", "aqui está", ou qualquer outra explicação ou comentário.
+  // prompt reforçado para forçar UMA sentença final, sem alternativas
+  const systemPrompt = `Você é um assistente de recados. Reescreva a mensagem abaixo em APENAS UMA frase natural, curta  e amigável com no máximo 30 palavras, como se ${senderName} tivesse pedido para enviar o recado.
+Mensagem original: "${content}"
+Regras:
+- A saída deve ser apenas UMA única frase pronta para envio.
+- Proibido listar opções, bullets, variações ou qualquer coisa que não seja a frase final.
+- Evite dizer "opções:" ou similar.
+Exemplo de saída: "Oi! ${senderName} pediu pra te avisar: [mensagem]".`;
 
-Exemplo:
-- Usuário: Remetente: 'Carlos', Conteúdo: 'Diz pra Ana que a reunião de amanhã foi confirmada.'
-- Sua Resposta: Oi, Ana! O Carlos pediu para avisar que a reunião de amanhã foi confirmada.`
-        },
-        { role: 'user', content: `Remetente: '${senderName}', Conteúdo: '${content}'` }
+  try {
+    const completion = await (poe || openai).chat.completions.create({
+      model: poe ? "Gemini-2.0-Flash" : "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: content }
       ],
-      max_tokens: 150,
+      max_tokens: 120,
       temperature: 0.5,
     });
-    return completion.choices[0]?.message?.content?.trim() || `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
+
+    let reply = completion.choices?.[0]?.message?.content?.trim() || "";
+    if (!reply) {
+      return `Oi! ${senderName} pediu pra te avisar: "${content}"`;
+    }
+
+    // normalizar: remover quebras de linha, bullets e pegar apenas a primeira linha "útil"
+    reply = reply.split(/\r?\n/).find(line => line.trim() !== "") || reply;
+    // se vier com bullets "1) ...", remove prefixos comuns
+    reply = reply.replace(/^[\s\-\d\.\)\:]+/, "").trim();
+
+    // garantir que é uma frase curta: truncar após primeiro ponto final longo se necessário (mas preferir não cortar)
+    // remover possíveis listas remanescentes
+    if (reply.includes("\n")) reply = reply.split("\n")[0].trim();
+
+    // fallback seguro
+    if (!reply) return `Oi! ${senderName} pediu pra te avisar: "${content}"`;
+
+    return reply;
   } catch (err) {
-    logger.warn({ event: 'openai.humanizeForwardedMessage.error', error: err.message });
-    return `Olá! ${senderName} pediu para te avisar:\n\n"${content}"`;
+    logger.errorWithContext("humanizeForwardedMessage.error", err);
+    return `Oi! ${senderName} pediu pra te avisar: "${content}"`;
   }
 }
-// ====================================================================
 
 /* -------------------
    PESQUISA EM TEMPO REAL (com limpeza de links)
@@ -345,7 +364,7 @@ async function summarizeDocument(text) {
     });
     return completion.choices[0]?.message?.content?.trim() || text.slice(0, 500);
   } catch (err) {
-    logger.error({ event: "document.summarize.error", error: err.message });
+    logger.error({ event: "document.summarize.error", error: err.message || err });
     return text.slice(0, 500);
   }
 }
@@ -374,7 +393,7 @@ async function extractAnyText(filePath, mimetype) {
     }
     return "";
   } catch (err) {
-    logger.error({ event: "file.extract.error", error: err.message });
+    logger.error({ event: "file.extract.error", error: err.message || err });
     return "";
   }
 }

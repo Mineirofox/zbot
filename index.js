@@ -2,9 +2,9 @@ const makeWASocket = require("@whiskeysockets/baileys").default;
 const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const logger = require("./logger");
-const { scheduleReminder, restoreReminders } = require("./scheduler");
-const { chatResponse, extractReminder, extractForwardMessage } = require("./openai");
-const { setContact, getContact } = require("./contactsManager");
+const { scheduleReminder, restoreReminders, getUserReminders } = require("./scheduler");
+const { chatResponse, extractReminder, extractForwardMessage, humanizeForwardedMessage } = require("./openai");
+const { setContact, getContact, listContacts, removeContact } = require("./contactsManager");
 
 // === helpers de digitação ===
 function startComposing(sock, jid) {
@@ -17,6 +17,48 @@ function startComposing(sock, jid) {
 async function stopComposing(sock, interval, jid) {
   clearInterval(interval);
   await sock.sendPresenceUpdate("paused", jid).catch(() => {});
+}
+
+// === utilitários para contatos ===
+function normalizeToJid(input) {
+  if (!input) return null;
+  input = ("" + input).trim();
+  if (input.includes("@")) {
+    const base = input.split("@")[0];
+    return base + "@s.whatsapp.net";
+  }
+  const digits = input.replace(/\D/g, "");
+  if (digits.length < 6) return null;
+  let normalized = digits;
+  if (normalized.length <= 11) normalized = "55" + normalized;
+  return `${normalized}@s.whatsapp.net`;
+}
+
+function parseEstabelecer(text) {
+  const t = text.trim();
+  const matchComo = t.match(/^!estabelecer\s+(.+?)\s+como\s+(.+)$/i);
+  if (matchComo) {
+    const left = matchComo[1].trim();
+    const right = matchComo[2].trim();
+    const leftDigits = left.replace(/\D/g, "");
+    const rightDigits = right.replace(/\D/g, "");
+    if (leftDigits.length >= 6 && leftDigits.length > rightDigits.length) {
+      return { number: left, alias: right };
+    } else if (rightDigits.length >= 6 && rightDigits.length > leftDigits.length) {
+      return { number: right, alias: left };
+    } else {
+      return { number: left, alias: right };
+    }
+  }
+  const matchTwo = t.match(/^!estabelecer\s+(\+?[0-9\-\s().]{6,})\s+(.+)$/i);
+  if (matchTwo) {
+    return { number: matchTwo[1].trim(), alias: matchTwo[2].trim() };
+  }
+  const matchTwoInv = t.match(/^!estabelecer\s+(.+?)\s+(\+?[0-9\-\s().]{6,})$/i);
+  if (matchTwoInv) {
+    return { number: matchTwoInv[2].trim(), alias: matchTwoInv[1].trim() };
+  }
+  return null;
 }
 
 if (process.platform === "win32") {
@@ -43,11 +85,13 @@ async function startBot() {
     const { connection, lastDisconnect } = update;
     if (connection === "open") {
       logger.info({ event: "connection.open" });
-
-      // 🔥 restaura lembretes (já humanizados pelo scheduler)
       await restoreReminders(
-        async (to, finalMsg, reminderObj) => {
+        async (to, content, reminderObj) => {
           const typing = startComposing(sock, to);
+          let finalMsg = content;
+          if (reminderObj?.recipient && reminderObj?.fromAlias) {
+            finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
+          }
           await sock.sendMessage(to, { text: finalMsg });
           await stopComposing(sock, typing, to);
         },
@@ -79,26 +123,107 @@ async function startBot() {
 
     logger.infoWithContext("message.received", { from, text });
 
-    // salvar nome do contato
-    if (m.pushName) {
-      await setContact(m.pushName, from);
+    if (!text || !text.trim()) {
+      return; // ignora mensagens vazias
     }
 
-    const typing = startComposing(sock, from);
+    const lower = text.trim().toLowerCase();
 
+    // === comandos de contatos e listagem ===
     try {
-      // primeiro tenta extrair mensagem para terceiro
-      const forward = await extractForwardMessage(text, from);
-      if (forward?.shouldSend) {
-        const recipientJid = await getContact(forward.recipient);
-        if (!recipientJid) {
-          await stopComposing(sock, typing, from);
-          await sock.sendMessage(from, {
-            text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.`,
-          });
+      if (lower.startsWith("!estabelecer")) {
+        const parsed = parseEstabelecer(text);
+        if (!parsed || !parsed.number || !parsed.alias) {
+          await sock.sendMessage(from, { text: "❌ Uso inválido. Exemplo: !estabelecer 5533999999999 como Juliana" });
+          return;
+        }
+        const jid = normalizeToJid(parsed.number);
+        if (!jid) {
+          await sock.sendMessage(from, { text: "❌ Número inválido." });
+          return;
+        }
+        await setContact(from, parsed.alias, jid);
+        await sock.sendMessage(from, { text: `✅ Contato salvo: *${parsed.alias}* → ${jid.replace(/@s\.whatsapp\.net$/, "")}` });
+        return;
+      }
+
+      if (lower === "!contatos") {
+        const contacts = await listContacts(from);
+        if (!contacts || Object.keys(contacts).length === 0) {
+          await sock.sendMessage(from, { text: "📭 Nenhum contato salvo." });
+          return;
+        }
+        const list = Object.entries(contacts)
+          .map(([alias, jid], i) => `#${i + 1} • *${alias}* — ${jid.replace(/@s\.whatsapp\.net$/, "")}`)
+          .join("\n");
+        await sock.sendMessage(from, { text: `📇 *Seus contatos salvos:*\n\n${list}` });
+        return;
+      }
+
+      if (lower.startsWith("!remover-contato")) {
+        const parts = text.split(/\s+/).slice(1);
+        if (parts.length === 0) {
+          await sock.sendMessage(from, { text: "❌ Uso: !remover-contato <apelido>" });
+          return;
+        }
+        const alias = parts.join(" ").trim();
+        await removeContact(from, alias);
+        await sock.sendMessage(from, { text: `🗑️ Contato *${alias}* removido (se existia).` });
+        return;
+      }
+
+      if (lower === "!listar") {
+        const reminders = await getUserReminders(from);
+
+        if (!reminders || reminders.length === 0) {
+          await sock.sendMessage(from, { text: "📭 Você não tem lembretes ou mensagens agendadas." });
           return;
         }
 
+        const pessoais = reminders.filter(r => !r.recipient || r.recipient === from);
+        const terceiros = reminders.filter(r => r.recipient && r.recipient !== from);
+
+        let resposta = "📋 *Seus lembretes e mensagens agendadas:*\n\n";
+
+        if (pessoais.length > 0) {
+          resposta += "⏰ *Lembretes pessoais:*\n";
+          pessoais.forEach((r, i) => {
+            resposta += `${i + 1}. ${r.content}\n   🗓️ ${r.date} às ${r.time}\n\n`;
+          });
+        } else {
+          resposta += "⏰ *Lembretes pessoais:* Nenhum.\n\n";
+        }
+
+        if (terceiros.length > 0) {
+          resposta += "📨 *Mensagens para contatos:*\n";
+          terceiros.forEach((r, i) => {
+            resposta += `${i + 1}. Para *${r.recipientAlias || r.recipient}*\n   ✉️ ${r.content}\n   🗓️ ${r.date} às ${r.time}\n\n`;
+          });
+        } else {
+          resposta += "📨 *Mensagens para contatos:* Nenhuma.\n";
+        }
+
+        await sock.sendMessage(from, { text: resposta.trim() });
+        return;
+      }
+    } catch (cmdErr) {
+      logger.errorWithContext("commands.contact.error", cmdErr);
+      await sock.sendMessage(from, { text: "⚠️ Erro ao processar comando de contatos." });
+      return;
+    }
+
+    // === fluxo normal ===
+    const typing = startComposing(sock, from);
+
+    try {
+      const forward = await extractForwardMessage(text, from);
+      if (forward?.shouldSend) {
+        const recipientJid = await getContact(from, forward.recipient);
+        if (!recipientJid) {
+          await stopComposing(sock, typing, from);
+          await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado.` });
+          return;
+        }
         await scheduleReminder(
           {
             from,
@@ -107,10 +232,12 @@ async function startBot() {
             time: forward.time,
             timezone: forward.timezone,
             content: forward.content,
-            fromAlias: m.pushName || from.replace(/@s\.whatsapp\.net$/, ""), // quem pediu
+            fromAlias: m.pushName || from.replace(/@s\.whatsapp\.net$/, ""),
+            recipientAlias: forward.recipient
           },
-          async (to, finalMsg, reminderObj) => {
+          async (to, content, reminderObj) => {
             const typingFwd = startComposing(sock, to);
+            const finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
             await sock.sendMessage(to, { text: finalMsg });
             await stopComposing(sock, typingFwd, to);
           },
@@ -122,22 +249,18 @@ async function startBot() {
             await stopComposing(sock, typingConf, creator);
           }
         );
-
         await stopComposing(sock, typing, from);
-        await sock.sendMessage(from, {
-          text: `📨 Mensagem agendada para ${forward.recipient}.`,
-        });
+        await sock.sendMessage(from, { text: `📨 Mensagem agendada para ${forward.recipient}.` });
         return;
       }
 
-      // tenta extrair lembrete pessoal
       const reminder = await extractReminder(text, from);
       if (reminder?.shouldRemind) {
         await scheduleReminder(
           { from, ...reminder },
-          async (to, finalMsg) => {
+          async (to, content) => {
             const typingRem = startComposing(sock, to);
-            await sock.sendMessage(to, { text: finalMsg });
+            await sock.sendMessage(to, { text: content });
             await stopComposing(sock, typingRem, to);
           },
           async (creator, reminderObj) => {
@@ -149,21 +272,18 @@ async function startBot() {
           }
         );
         await stopComposing(sock, typing, from);
-        await sock.sendMessage(from, {
-          text: `⏰ Lembrete agendado para ${reminder.date} às ${reminder.time}.`,
-        });
+        await sock.sendMessage(from, { text: `⏰ Lembrete agendado para ${reminder.date} às ${reminder.time}.` });
         return;
       }
 
-      // se não for lembrete nem mensagem para terceiros → resposta normal
       const reply = await chatResponse(text, from);
       await stopComposing(sock, typing, from);
-      await sock.sendMessage(from, { text: reply });
-
+      if (reply) {
+        await sock.sendMessage(from, { text: reply });
+      }
     } catch (err) {
       await stopComposing(sock, typing, from);
       logger.errorWithContext("messages.upsert.error", err);
-      await sock.sendMessage(from, { text: "⚠️ Erro ao processar sua mensagem." });
     }
   });
 
