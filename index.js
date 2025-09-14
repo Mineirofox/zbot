@@ -4,9 +4,9 @@ const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
 const logger = require("./logger");
-const { scheduleReminder, restoreReminders } = require("./scheduler"); // 🔥 atualizado
+const { scheduleReminder, restoreReminders } = require("./scheduler");
 const { chatResponse, extractReminder, extractForwardMessage } = require("./openai");
-const { setContact, getContact } = require("./contactsManager"); // ✅ CORRIGIDO
+const { setContact, getContact } = require("./contactsManager");
 const { clearContext } = require("./contextManager");
 
 if (process.platform === 'win32') {
@@ -29,10 +29,23 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === "open") {
       logger.info({ event: "connection.open" });
+
+      // 🔥 restaura lembretes apenas quando a conexão abre
+      await restoreReminders(
+        async (to, content) => {
+          await sock.sendMessage(to, { text: content });
+        },
+        async (creator, reminderObj) => {
+          await sock.sendMessage(creator, {
+            text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
+          });
+        }
+      );
+
     } else if (connection === "close") {
       logger.error({ event: "connection.close", lastDisconnect });
       startBot();
@@ -55,27 +68,22 @@ async function startBot() {
 
     // salvar nome do contato
     if (m.pushName) {
-      // ✅ CORRIGIDO: Usando o nome correto da função "setContact"
-      // Nota: Isso salvará/atualizará o contato com o nome de perfil do WhatsApp a cada mensagem.
       await setContact(m.pushName, from);
     }
 
     // primeiro tenta extrair mensagem para terceiro
     const forward = await extractForwardMessage(text, from);
     if (forward?.shouldSend) {
-      // ✅ CORRIGIDO: Usando o nome correto da função "getContact"
       const recipientJid = await getContact(forward.recipient);
-      
-      // Se não encontrar o JID pelo apelido, não é possível enviar
       if (!recipientJid) {
-          await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.` });
-          return;
+        await sock.sendMessage(from, { text: `❌ Contato "${forward.recipient}" não encontrado. Use o comando para adicionar.` });
+        return;
       }
 
       await scheduleReminder(
         {
           from,
-          recipient: recipientJid, // Usar o JID encontrado
+          recipient: recipientJid,
           date: forward.date,
           time: forward.time,
           timezone: forward.timezone,
@@ -115,18 +123,6 @@ async function startBot() {
     const reply = await chatResponse(text, from);
     await sock.sendMessage(from, { text: reply });
   });
-
-  // restaura lembretes ao iniciar
-  await restoreReminders(
-    async (to, content) => {
-      await sock.sendMessage(to, { text: content });
-    },
-    async (creator, reminderObj) => {
-      await sock.sendMessage(creator, {
-        text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
-      });
-    }
-  );
 
   logger.info({ event: "bot.start" });
 }

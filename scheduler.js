@@ -5,7 +5,7 @@ const utc = require("dayjs/plugin/utc");
 const timezonePlugin = require("dayjs/plugin/timezone");
 const { v4: uuidv4 } = require("uuid");
 const logger = require("./logger");
-// 🔥 IA para mensagens humanizadas (importando ambas as funções)
+// 🔥 IA para mensagens humanizadas
 const { generateReminderAlert, humanizeForwardedMessage } = require("./openai");
 
 dayjs.extend(utc);
@@ -50,15 +50,14 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
         logger.warnWithContext("scheduler.skip.deleted", { reminder });
         return;
       }
-      
+
       let finalMessage = "";
-      // Decide qual tipo de mensagem gerar com base nas propriedades do lembrete
       if (reminder.recipient && reminder.fromAlias && reminder.recipient !== reminder.from) {
-        // É uma mensagem para um terceiro, requisitada por 'fromAlias'
+        // Mensagem para terceiro
         logger.infoWithContext("scheduler.humanize.forward", { from: reminder.fromAlias });
         finalMessage = await humanizeForwardedMessage(reminder.content, reminder.fromAlias);
       } else {
-        // É um lembrete pessoal
+        // Lembrete pessoal
         logger.infoWithContext("scheduler.humanize.personal", { for: reminder.from });
         finalMessage = await generateReminderAlert(reminder.content);
       }
@@ -66,7 +65,6 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
       const target = reminder.recipient || reminder.from;
       await cb(target, finalMessage);
 
-      // confirmação para quem criou (se aplicável e se for diferente do alvo)
       if (confirmCb && reminder.from !== target) {
         await confirmCb(reminder.from, reminder);
       }
@@ -84,8 +82,11 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
   const delay = scheduledAt.diff(dayjs());
 
   if (delay <= 0) {
-    logger.warnWithContext("scheduler.past", { reminder });
-    run(); // Executa imediatamente se o tempo já passou
+    // lembrete no passado → descarta e remove do arquivo
+    logger.warnWithContext("scheduler.skip.past", { reminder });
+    const all = await loadReminders();
+    const left = all.filter(r => r.id !== reminder.id);
+    await saveReminders(left);
     return;
   }
 
@@ -103,25 +104,22 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
 async function restoreReminders(cb, confirmCb = null) {
   const reminders = await loadReminders();
   const now = dayjs();
-  
+
   const validReminders = [];
-  
+
   for (const reminder of reminders) {
     const scheduledAt = dayjs(`${reminder.date} ${reminder.time}`).tz(reminder.timezone, true);
     if (scheduledAt.isAfter(now)) {
-      scheduleReminder(reminder, cb, confirmCb);
+      await scheduleReminder(reminder, cb, confirmCb);
       validReminders.push(reminder);
     } else {
-       logger.warnWithContext("scheduler.restore.expired", { reminder });
+      logger.warnWithContext("scheduler.restore.expired", { reminder });
     }
   }
 
-  // Limpa lembretes expirados do arquivo de uma só vez
-  if (validReminders.length !== reminders.length) {
-    await saveReminders(validReminders);
-  }
+  // sobrescreve arquivo apenas com lembretes válidos
+  await saveReminders(validReminders);
 }
-
 
 // === utilitários ===
 async function getUserReminders(jid) {
@@ -132,7 +130,7 @@ async function getUserReminders(jid) {
 async function clearUserReminders(jid) {
   const reminders = await loadReminders();
   const left = reminders.filter(r => r.from !== jid);
-  
+
   // cancelar timers também
   const toCancel = reminders.filter(r => r.from === jid);
   for (const r of toCancel) {
