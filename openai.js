@@ -273,12 +273,11 @@ async function humanizeForwardedMessage(content, senderName) {
       messages: [
         {
           role: 'system',
-          content: `Você é um assistente de recados. Sua tarefa é reescrever uma mensagem que será enviada para alguém a pedido de outra pessoa.
-- O remetente original é: ${senderName}.
-- A mensagem original é: "${content}".
-- Elabore uma mensagem curta, amigável e direta para o destinatário, informando que ${senderName} pediu para enviar aquele recado.
-- Inicie a mensagem de forma casual (ex: "Oi, tudo bem?", "Olá!").
-- Não adicione informações que não estavam na mensagem original. Apenas reformule a entrega.`
+          content: `Você é um assistente de recados. Sua tarefa é reescrever uma ÚNICA mensagem natural para ser enviada a pedido de outra pessoa.
+- Quem pediu o envio: ${senderName}.
+- Mensagem original: "${content}".
+- Saída: apenas UMA frase curta, amigável e clara, como se fosse o próprio remetente pedindo para avisar.
+- Proibido listar opções, tópicos, bullets ou variações.`
         },
         { role: 'user', content: `Reescreva a mensagem de "${senderName}" para ser enviada a um terceiro. Conteúdo: "${content}"` }
       ],

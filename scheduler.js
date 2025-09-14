@@ -5,7 +5,6 @@ const utc = require("dayjs/plugin/utc");
 const timezonePlugin = require("dayjs/plugin/timezone");
 const { v4: uuidv4 } = require("uuid");
 const logger = require("./logger");
-// 🔥 IA para mensagens humanizadas
 const { generateReminderAlert, humanizeForwardedMessage } = require("./openai");
 
 dayjs.extend(utc);
@@ -53,7 +52,7 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
 
       let finalMessage = "";
       if (reminder.recipient && reminder.fromAlias && reminder.recipient !== reminder.from) {
-        // Mensagem para terceiro
+        // Mensagem para um terceiro
         logger.infoWithContext("scheduler.humanize.forward", { from: reminder.fromAlias });
         finalMessage = await humanizeForwardedMessage(reminder.content, reminder.fromAlias);
       } else {
@@ -63,8 +62,10 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
       }
 
       const target = reminder.recipient || reminder.from;
-      await cb(target, finalMessage);
+      // 🔥 agora o callback recebe também o objeto do reminder
+      await cb(target, finalMessage, reminder);
 
+      // confirmação para o criador (se aplicável e se for diferente do alvo)
       if (confirmCb && reminder.from !== target) {
         await confirmCb(reminder.from, reminder);
       }
@@ -82,7 +83,6 @@ async function scheduleReminder(reminder, cb, confirmCb = null) {
   const delay = scheduledAt.diff(dayjs());
 
   if (delay <= 0) {
-    // lembrete no passado → descarta e remove do arquivo
     logger.warnWithContext("scheduler.skip.past", { reminder });
     const all = await loadReminders();
     const left = all.filter(r => r.id !== reminder.id);
@@ -117,7 +117,6 @@ async function restoreReminders(cb, confirmCb = null) {
     }
   }
 
-  // sobrescreve arquivo apenas com lembretes válidos
   await saveReminders(validReminders);
 }
 

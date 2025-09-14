@@ -3,9 +3,8 @@ const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const logger = require("./logger");
 const { scheduleReminder, restoreReminders } = require("./scheduler");
-const { chatResponse, extractReminder, extractForwardMessage } = require("./openai");
+const { chatResponse, extractReminder, extractForwardMessage, humanizeForwardedMessage } = require("./openai");
 const { setContact, getContact } = require("./contactsManager");
-const dayjs = require("dayjs");
 
 // === helpers de digitação ===
 function startComposing(sock, jid) {
@@ -47,15 +46,20 @@ async function startBot() {
 
       // 🔥 restaura lembretes apenas quando a conexão abre
       await restoreReminders(
-        async (to, content) => {
+        async (to, content, reminderObj) => {
           const typing = startComposing(sock, to);
-          await sock.sendMessage(to, { text: content });
+          // humanizar se for mensagem para outro contato
+          let finalMsg = content;
+          if (reminderObj?.recipient && reminderObj?.fromAlias) {
+            finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
+          }
+          await sock.sendMessage(to, { text: finalMsg });
           await stopComposing(sock, typing, to);
         },
         async (creator, reminderObj) => {
           const typing = startComposing(sock, creator);
           await sock.sendMessage(creator, {
-            text: `✅ Seu lembrete foi entregue: "${reminderObj.content}"`,
+            text: `✅ Sua mensagem/lembrete foi entregue: "${reminderObj.content}"`,
           });
           await stopComposing(sock, typing, creator);
         }
@@ -106,11 +110,20 @@ async function startBot() {
             time: forward.time,
             timezone: forward.timezone,
             content: forward.content,
+            fromAlias: m.pushName || from.replace(/@s\.whatsapp\.net$/, ""), // quem pediu
           },
-          async (to, content) => {
+          async (to, content, reminderObj) => {
             const typingFwd = startComposing(sock, to);
-            await sock.sendMessage(to, { text: content });
+            const finalMsg = await humanizeForwardedMessage(reminderObj.content, reminderObj.fromAlias);
+            await sock.sendMessage(to, { text: finalMsg });
             await stopComposing(sock, typingFwd, to);
+          },
+          async (creator, reminderObj) => {
+            const typingConf = startComposing(sock, creator);
+            await sock.sendMessage(creator, {
+              text: `✅ Sua mensagem para ${forward.recipient} foi entregue.`,
+            });
+            await stopComposing(sock, typingConf, creator);
           }
         );
         await stopComposing(sock, typing, from);
